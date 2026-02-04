@@ -9,6 +9,10 @@ module_supports_os() {
   esac
 }
 
+module_is_installed() {
+  command -v tailscale >/dev/null 2>&1
+}
+
 module_requires_root() { return 0; }
 
 module_run() {
