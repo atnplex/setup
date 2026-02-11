@@ -2,15 +2,15 @@
 #
 # Server Bootstrap — Single Command Setup
 #
-# Usage (fresh Debian VM — public repo):
-#   curl -fsSL https://raw.githubusercontent.com/atnplex/setup/main/run.sh | bash
+# Usage (interactive — recommended, allows prompts):
+#   bash <(curl -fsSL https://raw.githubusercontent.com/atnplex/setup/main/run.sh)
 #
-# Usage (with pre-set tokens):
+# Usage (with pre-set tokens — no prompts needed):
 #   export BWS_ACCESS_TOKEN=... GH_TOKEN=ghp_...
-#   curl -fsSL https://raw.githubusercontent.com/atnplex/setup/main/run.sh | bash
+#   bash <(curl -fsSL https://raw.githubusercontent.com/atnplex/setup/main/run.sh)
 #
 # Usage (select specific modules):
-#   curl -fsSL https://raw.githubusercontent.com/atnplex/setup/main/run.sh | bash -s -- --module tailscale --module docker
+#   bash <(curl -fsSL https://raw.githubusercontent.com/atnplex/setup/main/run.sh) --module tailscale --module docker
 #
 set -euo pipefail
 
@@ -195,7 +195,23 @@ resolve_github_access() {
     echo -e "  your GitHub PAT. It is ${BOLD}not saved to disk${NC} — only held in"
     echo -e "  memory for the duration of this script."
     echo ""
-    read -rsp "  BWS Access Token: " BWS_ACCESS_TOKEN </dev/tty
+
+    # Try to read from terminal (handles both piped and interactive modes)
+    if [[ -t 0 ]]; then
+      # stdin is a terminal — read directly
+      read -rsp "  BWS Access Token: " BWS_ACCESS_TOKEN
+    elif [[ -r /dev/tty ]]; then
+      # stdin is piped but /dev/tty is available
+      read -rsp "  BWS Access Token: " BWS_ACCESS_TOKEN </dev/tty
+    else
+      echo ""
+      err "Cannot read input — stdin is piped and /dev/tty is not available."
+      err "Run interactively instead:"
+      err "  bash <(curl -fsSL https://raw.githubusercontent.com/atnplex/setup/main/run.sh)"
+      err "Or pre-set the token:"
+      err "  export BWS_ACCESS_TOKEN=... && bash <(curl -fsSL ...)"
+      return 1
+    fi
     echo ""
     echo ""
 
