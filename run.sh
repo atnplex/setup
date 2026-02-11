@@ -195,7 +195,7 @@ resolve_github_access() {
     echo -e "  your GitHub PAT. It is ${BOLD}not saved to disk${NC} — only held in"
     echo -e "  memory for the duration of this script."
     echo ""
-    read -rsp "  BWS Access Token: " BWS_ACCESS_TOKEN
+    read -rsp "  BWS Access Token: " BWS_ACCESS_TOKEN </dev/tty
     echo ""
     echo ""
 
