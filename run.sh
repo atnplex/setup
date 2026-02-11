@@ -375,6 +375,136 @@ clone_repo() {
   fi
 }
 
+# ─── Interactive post-bootstrap menu ─────────────────────────────────────
+_post_bootstrap_menu() {
+  local actions=()
+  local action_labels=()
+  local action_funcs=()
+
+  # ── Detect pending actions ──────────────────────────────────────────
+  _refresh_actions() {
+    actions=()
+    action_labels=()
+    action_funcs=()
+
+    # Tailscale not authenticated?
+    if command -v tailscale &>/dev/null && ! tailscale status &>/dev/null 2>&1; then
+      actions+=("tailscale")
+      action_labels+=("Authenticate Tailscale (connects this machine to your network)")
+      action_funcs+=("_action_tailscale")
+    fi
+
+    # GitHub CLI not authenticated?
+    if command -v gh &>/dev/null && ! gh auth status &>/dev/null 2>&1; then
+      actions+=("gh_auth")
+      action_labels+=("Authenticate GitHub CLI")
+      action_funcs+=("_action_gh_auth")
+    fi
+
+    # bashrc not sourced (check if NAMESPACE is in current env)
+    if ! grep -q "NAMESPACE" <(env 2>/dev/null) || [[ -z "${NAMESPACE_SOURCED:-}" ]]; then
+      actions+=("bashrc")
+      action_labels+=("Reload shell environment (source ~/.bashrc)")
+      action_funcs+=("_action_bashrc")
+    fi
+  }
+
+  # ── Action handlers ─────────────────────────────────────────────────
+  _action_tailscale() {
+    echo ""
+    log "Starting Tailscale authentication..."
+    echo -e "  ${BOLD}This will open Tailscale login. Follow the URL to authenticate.${NC}"
+    echo ""
+    if sudo tailscale up 2>&1; then
+      ok "Tailscale authenticated! IP: $(tailscale ip -4 2>/dev/null)"
+    else
+      warn "Tailscale authentication was cancelled or failed."
+      warn "You can always run 'sudo tailscale up' later."
+    fi
+    echo ""
+  }
+
+  _action_gh_auth() {
+    echo ""
+    log "Authenticating GitHub CLI..."
+    if [[ -n "${GH_TOKEN:-}" ]]; then
+      echo "$GH_TOKEN" | gh auth login --with-token 2>/dev/null
+      if gh auth status &>/dev/null 2>&1; then
+        ok "GitHub CLI authenticated via token"
+      else
+        warn "Token auth failed. You can run 'gh auth login' manually."
+      fi
+    else
+      warn "No GH_TOKEN available. Run 'gh auth login' manually."
+    fi
+    echo ""
+  }
+
+  _action_bashrc() {
+    echo ""
+    log "Reloading shell environment..."
+    # shellcheck disable=SC1090
+    source ~/.bashrc 2>/dev/null || true
+    export NAMESPACE_SOURCED=1
+    ok "Shell environment reloaded"
+    echo ""
+  }
+
+  # ── Menu loop ───────────────────────────────────────────────────────
+  while true; do
+    _refresh_actions
+
+    if [[ ${#actions[@]} -eq 0 ]]; then
+      echo -e "  ${GREEN}All setup actions complete! You're all set.${NC}"
+      echo ""
+      break
+    fi
+
+    echo -e "${BOLD}  Remaining setup actions:${NC}"
+    echo ""
+    local i=1
+    for label in "${action_labels[@]}"; do
+      echo -e "    ${BOLD}${i})${NC} ${label}"
+      ((i++))
+    done
+    echo ""
+    echo -e "    ${BOLD}a)${NC} Run all remaining actions"
+    echo -e "    ${BOLD}s)${NC} Skip — finish setup without running these"
+    echo ""
+
+    local choice
+    read -rp "  Choose an option: " choice </dev/tty 2>/dev/null || choice="s"
+
+    case "$choice" in
+    [Ss] | skip | "")
+      echo ""
+      echo -e "  ${YELLOW}Skipped remaining actions.${NC} You can run them later:"
+      for idx in "${!actions[@]}"; do
+        case "${actions[$idx]}" in
+        tailscale) echo "    • sudo tailscale up" ;;
+        gh_auth) echo "    • gh auth login" ;;
+        bashrc) echo "    • source ~/.bashrc" ;;
+        esac
+      done
+      echo ""
+      break
+      ;;
+    [Aa] | all)
+      for idx in "${!action_funcs[@]}"; do
+        "${action_funcs[$idx]}"
+      done
+      ;;
+    *)
+      if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#action_funcs[@]})); then
+        "${action_funcs[$((choice - 1))]}"
+      else
+        warn "Invalid option. Try again."
+      fi
+      ;;
+    esac
+  done
+}
+
 # ─── Main ────────────────────────────────────────────────────────────────
 main() {
   echo ""
@@ -438,26 +568,22 @@ main() {
   echo "  Run log:    $run_dir/"
   echo "  OS:         $OS_ID $OS_VERSION"
   echo ""
-  if command -v tailscale &>/dev/null; then
+
+  # Show installed services
+  command -v tailscale &>/dev/null && {
     if tailscale status &>/dev/null; then
-      echo "  ✓ Tailscale: $(tailscale ip -4 2>/dev/null || echo 'connected')"
+      echo -e "  ${GREEN}✓${NC} Tailscale: $(tailscale ip -4 2>/dev/null || echo 'connected')"
     else
-      echo "  ! Tailscale: installed but not authenticated"
-      echo "    → Run: sudo tailscale up"
+      echo -e "  ${YELLOW}!${NC} Tailscale: installed but not authenticated"
     fi
-  fi
-  if command -v docker &>/dev/null; then
-    echo "  ✓ Docker: $(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')"
-  fi
-  if command -v gh &>/dev/null; then
-    echo "  ✓ GitHub CLI: $(gh --version 2>/dev/null | head -1 | awk '{print $3}')"
-  fi
+  }
+  command -v docker &>/dev/null && echo -e "  ${GREEN}✓${NC} Docker: $(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')"
+  command -v gh &>/dev/null && echo -e "  ${GREEN}✓${NC} GitHub CLI: $(gh --version 2>/dev/null | head -1 | awk '{print $3}')"
+  command -v syncthing &>/dev/null && echo -e "  ${GREEN}✓${NC} Syncthing: $(syncthing --version 2>/dev/null | awk '{print $2}')"
   echo ""
-  echo "  Next steps:"
-  echo "    1. source ~/.bashrc"
-  echo "    2. sudo tailscale up  (if not yet authenticated)"
-  echo "    3. Open VS Code → Remote SSH → $(hostname)"
-  echo ""
+
+  # ─── Interactive post-bootstrap menu ─────────────────────────────────
+  _post_bootstrap_menu
 
   # Cleanup is handled by the EXIT trap (see cleanup() above)
 }
