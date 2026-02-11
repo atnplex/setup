@@ -77,7 +77,7 @@ install_base() {
   log "Installing base packages..."
   sudo apt-get update -qq
   sudo apt-get install -y -qq \
-    curl git jq rsync unzip python3 \
+    curl git jq rsync unzip python3 age keyutils \
     ca-certificates gnupg lsb-release \
     2>/dev/null
   ok "Base packages installed"
@@ -370,8 +370,25 @@ resolve_github_access() {
     return 0
   fi
 
-  # 3. Try BWS to fetch GitHub PAT
-  log "No GitHub access found. Attempting to fetch credentials via BWS..."
+  # 3. Try tiered secret resolution (env → keyctl → age file)
+  #    This handles subsequent boots without needing BWS at all
+  if type get_secret &>/dev/null; then
+    _secrets_init 2>/dev/null || true
+    log "Checking local secret stores for GitHub PAT..."
+    if get_secret "$BWS_SECRET_NAME_GH_PAT" 2>/dev/null; then
+      local cached_pat="${!BWS_SECRET_NAME_GH_PAT:-}"
+      if [[ -n "$cached_pat" ]] && ([[ "$cached_pat" =~ ^(ghp_|github_pat_|gho_) ]] || [[ ${#cached_pat} -ge 30 ]]); then
+        GH_TOKEN="$cached_pat"
+        export GH_TOKEN GITHUB_TOKEN="$GH_TOKEN"
+        ok "GitHub PAT resolved from local cache"
+        CLONE_METHOD="https"
+        return 0
+      fi
+    fi
+  fi
+
+  # 4. Fall through to BWS (remote, last resort)
+  log "No local credentials found. Fetching from BWS..."
 
   # Ensure BWS is installed
   install_bws || true
@@ -418,19 +435,24 @@ resolve_github_access() {
 
   export BWS_ACCESS_TOKEN
 
-  # Initialize BWS secrets cache (shared with other consumers like Tailscale)
+  # Initialize secrets system (age key, keyctl) if not already done
+  if type _secrets_init &>/dev/null; then
+    _secrets_init 2>/dev/null || true
+  fi
+
+  # Initialize BWS secrets cache
   log "Fetching secrets from BWS..."
   if ! _bws_init_secrets; then
     die "Check your BWS access token."
   fi
 
-  # Fetch GitHub PAT using the shared finder
-  log "Looking for GitHub PAT (preferred name: $BWS_SECRET_NAME_GH_PAT)..."
+  # Try get_secret (now with BWS available as tier 4)
+  log "Looking for GitHub PAT..."
   local pat=""
 
-  # Try exact/fuzzy match via shared helper
-  pat="$(_bws_find_secret "$BWS_SECRETS_JSON" "$BWS_SECRET_NAME_GH_PAT" \
-    "github" "gh_pat" "personal_access" "pat")" || true
+  if type get_secret &>/dev/null && get_secret "$BWS_SECRET_NAME_GH_PAT" "github" "gh_pat" "personal_access" "pat" 2>/dev/null; then
+    pat="${!BWS_SECRET_NAME_GH_PAT:-}"
+  fi
 
   # Validate: does it look like a GitHub PAT?
   if [[ -n "$pat" ]] && ! [[ "$pat" =~ ^(ghp_|github_pat_|gho_) ]] && [[ ${#pat} -lt 30 ]]; then
@@ -438,9 +460,8 @@ resolve_github_access() {
     pat=""
   fi
 
-  # Last resort: scan ALL secrets for GitHub PAT format
-  if [[ -z "$pat" ]]; then
-    log "Scanning all secrets for GitHub PAT format..."
+  # Fallback: scan ALL BWS secrets for GitHub PAT format
+  if [[ -z "$pat" ]] && [[ -n "$BWS_SECRETS_JSON" ]]; then
     local all_vals
     all_vals="$(echo "$BWS_SECRETS_JSON" | jq -r '.[] | "\(.key)\t\(.value)"' 2>/dev/null || true)"
     while IFS=$'\t' read -r secret_key secret_val; do
@@ -448,6 +469,10 @@ resolve_github_access() {
       if [[ "$secret_val" =~ ^(ghp_|github_pat_|gho_) ]]; then
         log "Found GitHub PAT format in secret '$secret_key'"
         pat="$secret_val"
+        if type _keyctl_set &>/dev/null; then
+          _keyctl_set "$BWS_SECRET_NAME_GH_PAT" "$pat"
+          _SECRETS_KNOWN["$BWS_SECRET_NAME_GH_PAT"]="$pat"
+        fi
         break
       fi
     done <<<"$all_vals"
@@ -468,6 +493,11 @@ resolve_github_access() {
   GH_TOKEN="$pat"
   export GH_TOKEN GITHUB_TOKEN="$GH_TOKEN"
   ok "GitHub PAT retrieved from BWS"
+
+  # Persist ALL fetched secrets to age file + keyctl for next boot
+  if type secrets_persist &>/dev/null; then
+    secrets_persist
+  fi
   CLONE_METHOD="https"
 }
 
@@ -523,25 +553,29 @@ _post_bootstrap_menu() {
   _action_tailscale() {
     echo ""
 
-    # Try to get auth key from BWS first
-    if [[ -n "${BWS_SECRETS_JSON:-}" ]]; then
-      local ts_key
-      ts_key="$(_bws_find_secret "$BWS_SECRETS_JSON" "TAILSCALE_AUTH_KEY" "tailscale" "authkey" "auth_key" "ts_auth")"
+    # Try to get auth key via tiered resolution (env → keyctl → age → BWS)
+    if type get_secret &>/dev/null; then
+      local ts_key=""
+      if get_secret "TAILSCALE_AUTH_KEY" "tailscale" "authkey" "auth_key" "ts_auth" 2>/dev/null; then
+        ts_key="${TAILSCALE_AUTH_KEY:-}"
+      fi
       if [[ -n "$ts_key" && "$ts_key" == tskey-auth-* ]]; then
-        log "Found Tailscale auth key in BWS — authenticating automatically..."
+        log "Found Tailscale auth key — authenticating automatically..."
         if sudo tailscale up --authkey="$ts_key" --accept-routes --ssh --hostname="${MACHINE_HOSTNAME:-}" 2>&1; then
           ok "Tailscale authenticated automatically! IP: $(tailscale ip -4 2>/dev/null)"
           echo ""
           return
         fi
-        warn "Auto-auth with BWS key failed, falling back to interactive..."
+        warn "Auto-auth failed, trying API key..."
       fi
 
       # Try generating an auth key via Tailscale API
-      local ts_api_key
-      ts_api_key="$(_bws_find_secret "$BWS_SECRETS_JSON" "TAILSCALE_API_KEY" "tailscale_api" "ts_api")"
+      local ts_api_key=""
+      if get_secret "TAILSCALE_API_KEY" "tailscale_api" "ts_api" 2>/dev/null; then
+        ts_api_key="${TAILSCALE_API_KEY:-}"
+      fi
       if [[ -n "$ts_api_key" ]]; then
-        log "Found Tailscale API key in BWS — generating auth key..."
+        log "Found Tailscale API key — generating auth key..."
         local gen_key
         gen_key="$(curl -fsSL -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
           -u "$ts_api_key:" \
@@ -659,6 +693,21 @@ main() {
   [[ "$OS_ID" == "debian" || "$OS_ID" == "ubuntu" ]] || die "Only Debian/Ubuntu supported (got: $OS_ID)"
 
   install_base
+
+  # Source secrets library (needed before repo clone for resolve_github_access)
+  if [[ -f "$SETUP_REPO_DIR/lib/secrets.sh" ]]; then
+    # shellcheck source=lib/secrets.sh
+    source "$SETUP_REPO_DIR/lib/secrets.sh"
+  else
+    log "Loading secrets library..."
+    local secrets_lib
+    secrets_lib="$(curl -fsSL "https://raw.githubusercontent.com/${GH_ORG}/setup/main/lib/secrets.sh" 2>/dev/null || true)"
+    if [[ -n "$secrets_lib" ]]; then
+      eval "$secrets_lib"
+    else
+      warn "Could not load secrets library. Tiered resolution unavailable."
+    fi
+  fi
 
   # Detect environment type (OCI/cloud/VM/bare) and set hostname
   detect_environment

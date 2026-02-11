@@ -1,3 +1,4 @@
+# shellcheck disable=SC2034
 MODULE_ID="tailscale"
 MODULE_DESC="Install and configure Tailscale"
 MODULE_ORDER=30
@@ -22,6 +23,12 @@ module_run() {
   if ! command -v tailscale >/dev/null 2>&1; then
     log_error "Tailscale not found after install."
     return 1
+  fi
+
+  # Try tiered secret resolution for auth key
+  if [[ -z "${TAILSCALE_AUTHKEY:-}" ]] && type get_secret &>/dev/null; then
+    get_secret "TAILSCALE_AUTH_KEY" "tailscale" "authkey" "ts_auth" 2>/dev/null || true
+    TAILSCALE_AUTHKEY="${TAILSCALE_AUTH_KEY:-}"
   fi
 
   if [[ -z "${TAILSCALE_AUTHKEY:-}" ]]; then
