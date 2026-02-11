@@ -75,11 +75,14 @@ detect_os() {
 # ─── Install base packages ──────────────────────────────────────────────
 install_base() {
   log "Installing base packages..."
+  export DEBIAN_FRONTEND=noninteractive
   sudo apt-get update -qq
-  sudo apt-get install -y -qq \
-    curl git jq rsync unzip python3 age keyutils \
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    curl git jq rsync unzip python3 keyutils \
     ca-certificates gnupg lsb-release \
     2>/dev/null
+  # age installed separately by _secrets_init (with binary fallback)
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq age 2>/dev/null || true
   ok "Base packages installed"
 }
 
