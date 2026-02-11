@@ -22,11 +22,14 @@ YELLOW='\033[1;33m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-log()  { echo -e "${BLUE}[SETUP]${NC} $*"; }
-ok()   { echo -e "${GREEN}[✓]${NC} $*"; }
+log() { echo -e "${BLUE}[SETUP]${NC} $*"; }
+ok() { echo -e "${GREEN}[✓]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
-err()  { echo -e "${RED}[✗]${NC} $*"; }
-die()  { err "$@"; exit 1; }
+err() { echo -e "${RED}[✗]${NC} $*"; }
+die() {
+  err "$@"
+  exit 1
+}
 
 # ─── Defaults (inline — no file dependency for curl|bash) ───────────────
 NAMESPACE="${NAMESPACE:-/atn}"
@@ -70,25 +73,48 @@ install_bws() {
   fi
 
   log "Installing Bitwarden Secrets CLI..."
-  local bws_version="1.1.0"
+
+  # Detect architecture
   local arch
   arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
   case "$arch" in
-    amd64) arch="x86_64" ;;
-    arm64) arch="aarch64" ;;
+  amd64) arch="x86_64" ;;
+  arm64) arch="aarch64" ;;
   esac
 
-  local url="https://github.com/bitwarden/sdk-internal/releases/download/bws-v${bws_version}/bws-${arch}-unknown-linux-gnu-${bws_version}.zip"
+  # Dynamically fetch latest BWS version from GitHub API
+  local bws_version=""
+  local api_response
+  api_response="$(curl -fsSL "https://api.github.com/repos/bitwarden/sdk/releases?per_page=10" 2>/dev/null || echo '')"
+  if [[ -n "$api_response" ]]; then
+    bws_version="$(echo "$api_response" | jq -r '[.[] | select(.tag_name | startswith("bws-v"))][0].tag_name // ""' 2>/dev/null | sed 's/^bws-v//')"
+  fi
+  # Fallback to known-good version
+  bws_version="${bws_version:-2.0.0}"
+  log "BWS CLI version: $bws_version"
+
+  # Download from bitwarden/sdk-sm (where release binaries are hosted)
+  local url="https://github.com/bitwarden/sdk-sm/releases/download/bws-v${bws_version}/bws-${arch}-unknown-linux-gnu-${bws_version}.zip"
   local tmp_dir
   tmp_dir="$(mktemp -d)"
+  log "Downloading from: $url"
   if curl -fsSL "$url" -o "$tmp_dir/bws.zip"; then
     unzip -q "$tmp_dir/bws.zip" -d "$tmp_dir"
-    sudo install -m 755 "$tmp_dir/bws" /usr/local/bin/bws
-    rm -rf "$tmp_dir"
-    ok "BWS CLI installed"
+    # Find the bws binary (might be in a subdirectory)
+    local bws_bin
+    bws_bin="$(find "$tmp_dir" -name 'bws' -type f | head -1)"
+    if [[ -n "$bws_bin" ]]; then
+      sudo install -m 755 "$bws_bin" /usr/local/bin/bws
+      rm -rf "$tmp_dir"
+      ok "BWS CLI $bws_version installed"
+    else
+      rm -rf "$tmp_dir"
+      err "BWS binary not found in downloaded archive"
+      return 1
+    fi
   else
     rm -rf "$tmp_dir"
-    warn "Failed to install BWS CLI — you may need to install it manually"
+    err "Failed to download BWS CLI from $url"
     return 1
   fi
 }
@@ -168,8 +194,8 @@ resolve_github_access() {
   # Fetch GitHub PAT from BWS
   log "Fetching GitHub PAT from BWS (secret: $BWS_SECRET_NAME_GH_PAT)..."
   local pat
-  pat="$(bws secret list -t "$BWS_ACCESS_TOKEN" -o json 2>/dev/null \
-    | jq -r --arg name "$BWS_SECRET_NAME_GH_PAT" '.[] | select(.key == $name) | .value' 2>/dev/null || echo '')"
+  pat="$(bws secret list -t "$BWS_ACCESS_TOKEN" -o json 2>/dev/null |
+    jq -r --arg name "$BWS_SECRET_NAME_GH_PAT" '.[] | select(.key == $name) | .value' 2>/dev/null || echo '')"
 
   if [[ -z "$pat" ]]; then
     die "Could not retrieve '$BWS_SECRET_NAME_GH_PAT' from BWS. Check your token and secret name."
