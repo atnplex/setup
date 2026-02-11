@@ -1,167 +1,488 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ─── VM1 Post-Bootstrap Fix Script ─────────────────────────────────────
-# Run this on vm1 to fix what the bootstrap missed
+# ─── VM Post-Bootstrap Fix Script ──────────────────────────────────────
+# Self-healing: checks state first, fixes only what's wrong.
+# Proper dependency order: infra → connectivity → repos → config → data
+#
+# Usage: bash fix-vm.sh [source_host]   (default: vps2)
+# ───────────────────────────────────────────────────────────────────────
 
+# ── Colors & Logging ───────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
-log() { echo -e "  ${BLUE}[FIX]${NC} $*"; }
+log() { echo -e "  ${BLUE}[•]${NC} $*"; }
 ok() { echo -e "  ${GREEN}[✓]${NC} $*"; }
 warn() { echo -e "  ${YELLOW}[!]${NC} $*"; }
 err() { echo -e "  ${RED}[✗]${NC} $*"; }
+step() { echo -e "\n${BOLD}── $* ──${NC}"; }
 
-SOURCE_HOST="${1:-vps2}" # Default source to sync from
+SOURCE="${1:-vps2}"
+NAMESPACE="/atn"
+GITHUB_ORG="atnplex"
+FIXES=0
+SKIPS=0
+FAILS=0
+fixed() {
+  ((FIXES++))
+  ok "$*"
+}
+skipped() {
+  ((SKIPS++))
+  ok "$* (already done)"
+}
+failed() {
+  ((FAILS++))
+  err "$*"
+}
 
 echo ""
-echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-echo -e "${BOLD}  VM1 Post-Bootstrap Fix${NC}"
-echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}══════════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}  Post-Bootstrap Fix — Self-Healing Mode${NC}"
+echo -e "${BOLD}══════════════════════════════════════════════════════════${NC}"
+echo -e "  Source: ${SOURCE}  |  Namespace: ${NAMESPACE}"
 echo ""
 
-# ── 1. Fix Tailscale hostname + enable SSH + accept routes ──────────
-log "Fixing Tailscale configuration..."
-if command -v tailscale &>/dev/null; then
-  current_ts_host="$(tailscale status --self --json 2>/dev/null | jq -r '.Self.HostName' 2>/dev/null || echo '')"
-  system_host="$(hostname)"
+# ═══════════════════════════════════════════════════════════════════════
+# PHASE 1: LOCAL INFRASTRUCTURE (no network needed)
+# ═══════════════════════════════════════════════════════════════════════
 
-  if [[ "$current_ts_host" != "$system_host" ]]; then
-    log "Tailscale hostname '$current_ts_host' doesn't match system hostname '$system_host'"
-    log "Re-running tailscale up with correct hostname, SSH, and routes..."
-    sudo tailscale up --hostname="$system_host" --ssh --accept-routes --accept-dns 2>&1
-    ok "Tailscale reconfigured: hostname=$system_host, ssh=on, accept-routes=on"
-  else
-    # Still ensure SSH and routes are enabled
-    sudo tailscale set --ssh --accept-routes --accept-dns 2>/dev/null ||
-      sudo tailscale up --hostname="$system_host" --ssh --accept-routes --accept-dns 2>&1
-    ok "Tailscale already correct: $current_ts_host"
-  fi
+step "Phase 1: Local Infrastructure"
 
-  echo "  Tailscale IP: $(tailscale ip -4 2>/dev/null)"
+# ── 1a. System hostname ────────────────────────────────────────────────
+log "Checking system hostname..."
+CURRENT_HOSTNAME="$(hostname)"
+if [[ "$CURRENT_HOSTNAME" =~ ^(vm|vps|srv)[0-9]+$ ]]; then
+  skipped "Hostname: $CURRENT_HOSTNAME"
 else
-  err "Tailscale not installed!"
+  warn "Hostname '$CURRENT_HOSTNAME' doesn't follow convention (vm1/vps1/srv1)"
+  warn "Set it manually: sudo hostnamectl set-hostname vm1"
 fi
-echo ""
 
-# ── 2. Generate SSH key if missing ──────────────────────────────────
+# ── 1b. Required packages ─────────────────────────────────────────────
+log "Checking required packages..."
+MISSING_PKGS=()
+for pkg in curl git jq rsync python3 keyutils openssh-client; do
+  if ! dpkg -l "$pkg" &>/dev/null; then
+    MISSING_PKGS+=("$pkg")
+  fi
+done
+if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
+  log "Installing missing: ${MISSING_PKGS[*]}"
+  export DEBIAN_FRONTEND=noninteractive
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${MISSING_PKGS[@]}" 2>/dev/null
+  fixed "Installed: ${MISSING_PKGS[*]}"
+else
+  skipped "All required packages installed"
+fi
+
+# ── 1c. age encryption ────────────────────────────────────────────────
+log "Checking age encryption..."
+if command -v age &>/dev/null; then
+  skipped "age installed"
+else
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq age 2>/dev/null || {
+    log "age not in repos, installing from GitHub..."
+    AGE_URL="https://dl.filippo.io/age/latest?for=linux/amd64"
+    curl -fsSL "$AGE_URL" | sudo tar -xz -C /usr/local/bin/ 2>/dev/null
+  }
+  command -v age &>/dev/null && fixed "age installed" || failed "Could not install age"
+fi
+
+# ── 1d. Namespace directory structure ─────────────────────────────────
+log "Checking namespace directory structure..."
+DIRS_NEEDED=0
+for d in "$NAMESPACE"/{.gemini/antigravity/{skills,global_workflows,scratch,personas,brain},.agent/{rules,learning/reflections},baseline,github,bin,logs}; do
+  if [[ ! -d "$d" ]]; then
+    mkdir -p "$d"
+    ((DIRS_NEEDED++))
+  fi
+done
+# Home dirs
+for d in "$HOME"/.gemini/antigravity/{brain,knowledge,scratch}; do
+  if [[ ! -d "$d" ]]; then
+    mkdir -p "$d"
+    ((DIRS_NEEDED++))
+  fi
+done
+if [[ $DIRS_NEEDED -gt 0 ]]; then
+  fixed "Created $DIRS_NEEDED missing directories"
+else
+  skipped "Namespace directory structure complete"
+fi
+
+# ── 1e. SSH key ────────────────────────────────────────────────────────
 log "Checking SSH keys..."
-if [[ ! -f ~/.ssh/id_ed25519 ]]; then
-  log "Generating SSH key..."
-  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -C "alex@$(hostname)"
-  ok "SSH key generated"
+if [[ -f "$HOME/.ssh/id_ed25519" ]]; then
+  skipped "SSH key exists"
 else
-  ok "SSH key exists"
+  ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519" -N "" -C "$USER@$(hostname)" -q
+  fixed "Generated SSH key"
 fi
-echo ""
 
-# ── 3. Test Tailscale SSH to source ─────────────────────────────────
-log "Testing Tailscale SSH to $SOURCE_HOST..."
-if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "alex@$SOURCE_HOST" 'echo ok' 2>/dev/null; then
-  ok "SSH to $SOURCE_HOST works via Tailscale"
+# ── 1f. SSH config ────────────────────────────────────────────────────
+log "Checking SSH config..."
+if [[ -f "$HOME/.ssh/config" ]] && grep -q "Host vps2" "$HOME/.ssh/config" 2>/dev/null; then
+  skipped "SSH config has entries"
 else
-  warn "SSH to $SOURCE_HOST failed. Trying by IP..."
-  SOURCE_IP="$(tailscale status --json 2>/dev/null | jq -r ".Peer[] | select(.HostName==\"$SOURCE_HOST\") | .TailscaleIPs[0]" 2>/dev/null || echo '')"
-  if [[ -n "$SOURCE_IP" ]]; then
-    SOURCE_HOST="$SOURCE_IP"
-    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "alex@$SOURCE_IP" 'echo ok' 2>/dev/null; then
-      ok "SSH to $SOURCE_HOST works via IP"
-    else
-      err "Cannot SSH to $SOURCE_HOST. Fix Tailscale SSH on both ends first."
-      err "On $SOURCE_HOST run: sudo tailscale set --ssh"
-      exit 1
-    fi
+  cat >>"$HOME/.ssh/config" <<'SSHCONF'
+
+# ─── Tailscale Hosts (auto-generated by fix-vm.sh) ───
+Host vps1
+  HostName vps1
+  User alex
+  ForwardAgent yes
+
+Host vps2
+  HostName vps2
+  User alex
+  ForwardAgent yes
+
+Host unraid
+  HostName unraid
+  User root
+
+Host *
+  AddKeysToAgent yes
+  IdentityFile ~/.ssh/id_ed25519
+  ServerAliveInterval 60
+  ServerAliveCountMax 3
+  StrictHostKeyChecking accept-new
+SSHCONF
+  chmod 600 "$HOME/.ssh/config"
+  fixed "Created SSH config"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════
+# PHASE 2: NETWORK — Tailscale (needed before anything remote)
+# ═══════════════════════════════════════════════════════════════════════
+
+step "Phase 2: Tailscale Configuration"
+
+if ! command -v tailscale &>/dev/null; then
+  failed "Tailscale not installed — run bootstrap first"
+else
+  # ── 2a. Tailscale hostname match ──────────────────────────────────
+  TS_HOST="$(tailscale status --self --json 2>/dev/null | jq -r '.Self.HostName // empty' 2>/dev/null || echo '')"
+  SYS_HOST="$(hostname)"
+
+  if [[ -z "$TS_HOST" ]]; then
+    warn "Tailscale not connected. Attempting to bring up..."
+    sudo tailscale up --hostname="$SYS_HOST" --ssh --accept-routes --accept-dns 2>&1 || {
+      failed "Could not connect Tailscale"
+    }
+    TS_HOST="$SYS_HOST"
+    fixed "Tailscale connected as $TS_HOST"
+  elif [[ "$TS_HOST" != "$SYS_HOST" ]]; then
+    log "Tailscale hostname '$TS_HOST' ≠ system hostname '$SYS_HOST' — fixing..."
+    sudo tailscale set --hostname="$SYS_HOST" 2>/dev/null ||
+      sudo tailscale up --hostname="$SYS_HOST" --ssh --accept-routes --accept-dns 2>&1
+    fixed "Tailscale hostname → $SYS_HOST"
   else
-    err "Cannot find $SOURCE_HOST in Tailscale mesh"
-    exit 1
+    skipped "Tailscale hostname: $TS_HOST"
+  fi
+
+  # ── 2b. Tailscale SSH + routes ────────────────────────────────────
+  TS_PREFS="$(tailscale debug prefs 2>/dev/null || echo '{}')"
+  TS_SSH="$(echo "$TS_PREFS" | jq -r '.RunSSH // false' 2>/dev/null || echo 'false')"
+
+  if [[ "$TS_SSH" != "true" ]]; then
+    sudo tailscale set --ssh --accept-routes --accept-dns 2>/dev/null || true
+    fixed "Enabled Tailscale SSH + accept-routes"
+  else
+    skipped "Tailscale SSH enabled"
+  fi
+
+  echo "  Tailscale IP: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
+fi
+
+# ── 2c. Test connectivity to source ─────────────────────────────────
+step "Phase 2b: Connectivity to $SOURCE"
+
+SSH_OK=false
+log "Testing SSH to $SOURCE..."
+
+# Try hostname first (MagicDNS)
+if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+  "$USER@$SOURCE" 'echo ok' 2>/dev/null; then
+  ok "SSH to $SOURCE works"
+  SSH_OK=true
+else
+  # Fallback: try finding IP from tailscale status
+  SOURCE_IP="$(tailscale status 2>/dev/null | awk -v h="$SOURCE" '$2==h {print $1}')"
+  if [[ -n "$SOURCE_IP" ]]; then
+    log "MagicDNS failed, trying IP $SOURCE_IP..."
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      "$USER@$SOURCE_IP" 'echo ok' 2>/dev/null; then
+      SOURCE="$SOURCE_IP"
+      ok "SSH to $SOURCE works via IP"
+      SSH_OK=true
+    fi
+  fi
+
+  if [[ "$SSH_OK" == "false" ]]; then
+    warn "Cannot SSH to $SOURCE. Tailscale SSH may not be enabled on the remote."
+    warn "On $SOURCE run: sudo tailscale set --ssh"
+    warn "Skipping remote sync phases. Local-only fixes applied."
   fi
 fi
-echo ""
 
-# ── 4. Sync brains/conversations ────────────────────────────────────
-log "Syncing brains/conversations from $SOURCE_HOST..."
-mkdir -p ~/.gemini/antigravity/brain
-rsync -az --timeout=30 \
-  "alex@${SOURCE_HOST}:~/.gemini/antigravity/brain/" \
-  ~/.gemini/antigravity/brain/ 2>/dev/null &&
-  ok "Brains synced: $(ls -1 ~/.gemini/antigravity/brain/ | wc -l) conversations" ||
-  warn "Brain sync failed"
-echo ""
+# ═══════════════════════════════════════════════════════════════════════
+# PHASE 3: GIT REPOS (from GitHub, not rsync — git is source of truth)
+# ═══════════════════════════════════════════════════════════════════════
 
-# ── 5. Sync knowledge items ────────────────────────────────────────
-log "Syncing knowledge items from $SOURCE_HOST..."
-mkdir -p ~/.gemini/antigravity/knowledge
-rsync -az --timeout=30 \
-  "alex@${SOURCE_HOST}:~/.gemini/antigravity/knowledge/" \
-  ~/.gemini/antigravity/knowledge/ 2>/dev/null &&
-  ok "Knowledge synced: $(ls -1 ~/.gemini/antigravity/knowledge/ | wc -l) items" ||
-  warn "Knowledge sync failed"
-echo ""
+step "Phase 3: Git Repositories"
 
-# ── 6. Clone/sync repos from source ────────────────────────────────
-log "Syncing repos from $SOURCE_HOST..."
-mkdir -p /atn/github
+# ── 3a. GitHub auth check ────────────────────────────────────────────
+log "Checking GitHub access..."
+GH_ACCESS=false
+if ssh -o ConnectTimeout=5 -T git@github.com 2>&1 | grep -qi "success\|welcome\|authenticated"; then
+  ok "GitHub SSH access works"
+  GH_ACCESS=true
+elif command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+  ok "GitHub CLI authenticated"
+  GH_ACCESS=true
+else
+  # Try HTTPS with credential helper
+  if git ls-remote "https://github.com/${GITHUB_ORG}/setup.git" HEAD &>/dev/null 2>&1; then
+    ok "GitHub HTTPS access works"
+    GH_ACCESS=true
+  else
+    warn "No GitHub access. Will try rsync from $SOURCE if SSH works."
+  fi
+fi
 
-# Get list of repos on source
-REPOS="$(ssh -o ConnectTimeout=5 "alex@${SOURCE_HOST}" \
-  'ls -1d /atn/github/*/  2>/dev/null | xargs -I{} basename {}' 2>/dev/null || echo '')"
+# ── 3b. Clone/update repos ──────────────────────────────────────────
+REPOS=("setup" "atn" "infrastructure")
 
-if [[ -n "$REPOS" ]]; then
-  while IFS= read -r repo; do
-    [[ -z "$repo" ]] && continue
-    if [[ -d "/atn/github/$repo/.git" ]]; then
-      ok "Repo $repo already exists — pulling updates"
-      (cd "/atn/github/$repo" && git pull --quiet 2>/dev/null) || true
+for repo in "${REPOS[@]}"; do
+  REPO_DIR="$NAMESPACE/github/$repo"
+  if [[ -d "$REPO_DIR/.git" ]]; then
+    log "Updating $repo..."
+    (cd "$REPO_DIR" && git pull --quiet 2>/dev/null) && skipped "Repo $repo up to date" || warn "Failed to update $repo"
+  elif [[ "$GH_ACCESS" == "true" ]]; then
+    log "Cloning $repo..."
+    git clone --quiet "https://github.com/${GITHUB_ORG}/${repo}.git" "$REPO_DIR" 2>/dev/null &&
+      fixed "Cloned $repo" || warn "Failed to clone $repo (may not exist)"
+  elif [[ "$SSH_OK" == "true" ]]; then
+    log "Syncing $repo from $SOURCE..."
+    rsync -az --timeout=60 "$USER@${SOURCE}:${NAMESPACE}/github/$repo/" "$REPO_DIR/" 2>/dev/null &&
+      fixed "Synced $repo from $SOURCE" || warn "Failed to sync $repo"
+  else
+    failed "Cannot get $repo — no GitHub access and no SSH to $SOURCE"
+  fi
+done
+
+# ═══════════════════════════════════════════════════════════════════════
+# PHASE 4: AGENT CONFIG (rules, skills, workflows, MCP)
+# ═══════════════════════════════════════════════════════════════════════
+
+step "Phase 4: Agent Configuration"
+
+SETUP_DIR="$NAMESPACE/github/setup"
+CONFIG_DIR="$SETUP_DIR/config"
+
+if [[ ! -d "$CONFIG_DIR" ]]; then
+  failed "Config dir not found at $CONFIG_DIR — setup repo missing"
+else
+  # ── 4a. GEMINI.md ──────────────────────────────────────────────────
+  if [[ -f "$NAMESPACE/.gemini/GEMINI.md" ]]; then
+    # Check if it's current
+    if diff -q "$CONFIG_DIR/gemini/GEMINI.md" "$NAMESPACE/.gemini/GEMINI.md" &>/dev/null; then
+      skipped "GEMINI.md matches repo"
     else
-      log "Syncing $repo..."
-      rsync -az --timeout=60 \
-        "alex@${SOURCE_HOST}:/atn/github/$repo/" \
-        "/atn/github/$repo/" 2>/dev/null &&
-        ok "Synced $repo" || warn "Failed to sync $repo"
+      cp "$CONFIG_DIR/gemini/GEMINI.md" "$NAMESPACE/.gemini/GEMINI.md"
+      fixed "Updated GEMINI.md"
     fi
-  done <<<"$REPOS"
-else
-  warn "No repos found on $SOURCE_HOST or SSH failed"
+  else
+    cp "$CONFIG_DIR/gemini/GEMINI.md" "$NAMESPACE/.gemini/GEMINI.md" 2>/dev/null &&
+      fixed "Deployed GEMINI.md" || failed "Could not deploy GEMINI.md"
+  fi
+
+  # ── 4b. Rules ──────────────────────────────────────────────────────
+  if [[ -d "$CONFIG_DIR/agent/rules" ]]; then
+    RULE_COUNT_SRC=$(find "$CONFIG_DIR/agent/rules" -type f | wc -l)
+    RULE_COUNT_DST=$(find "$NAMESPACE/.agent/rules" -type f 2>/dev/null | wc -l)
+    if [[ "$RULE_COUNT_SRC" -eq "$RULE_COUNT_DST" ]]; then
+      skipped "Rules: $RULE_COUNT_DST deployed"
+    else
+      cp -r "$CONFIG_DIR/agent/rules/"* "$NAMESPACE/.agent/rules/" 2>/dev/null
+      fixed "Deployed $RULE_COUNT_SRC rules (was $RULE_COUNT_DST)"
+    fi
+  fi
+
+  # ── 4c. Skills ─────────────────────────────────────────────────────
+  if [[ -d "$CONFIG_DIR/gemini/skills" ]]; then
+    cp -ru "$CONFIG_DIR/gemini/skills/"* "$NAMESPACE/.gemini/antigravity/skills/" 2>/dev/null
+    SKILL_COUNT=$(find "$NAMESPACE/.gemini/antigravity/skills" -maxdepth 1 -type d | wc -l)
+    ok "Skills: $((SKILL_COUNT - 1)) deployed"
+  fi
+
+  # ── 4d. Workflows ──────────────────────────────────────────────────
+  if [[ -d "$CONFIG_DIR/gemini/global_workflows" ]]; then
+    cp -ru "$CONFIG_DIR/gemini/global_workflows/"* "$NAMESPACE/.gemini/antigravity/global_workflows/" 2>/dev/null
+    WF_COUNT=$(find "$NAMESPACE/.gemini/antigravity/global_workflows" -type f | wc -l)
+    ok "Workflows: $WF_COUNT deployed"
+  fi
+
+  # ── 4e. MCP config ─────────────────────────────────────────────────
+  if [[ -f "$CONFIG_DIR/gemini/mcp_config.json" ]]; then
+    sed -e "s|\${HOME}|$HOME|g" \
+      -e "s|\${NAMESPACE}|$NAMESPACE|g" \
+      "$CONFIG_DIR/gemini/mcp_config.json" >"$NAMESPACE/.gemini/antigravity/mcp_config.json"
+    ok "MCP config rendered"
+  fi
+
+  # ── 4f. VS Code machine settings ──────────────────────────────────
+  VSCODE_DIR="$NAMESPACE/.antigravity-server/data/Machine"
+  if [[ -f "$CONFIG_DIR/vscode/machine-settings.json" ]]; then
+    mkdir -p "$VSCODE_DIR"
+    if [[ -f "$VSCODE_DIR/settings.json" ]]; then
+      # Merge: keep existing, add missing keys
+      python3 -c "
+import json
+existing = json.load(open('$VSCODE_DIR/settings.json'))
+template = json.load(open('$CONFIG_DIR/vscode/machine-settings.json'))
+added = 0
+for k, v in template.items():
+    if k not in existing:
+        existing[k] = v
+        added += 1
+json.dump(existing, open('$VSCODE_DIR/settings.json', 'w'), indent=2)
+print(f'{added} new keys merged')
+" 2>/dev/null && ok "VS Code settings merged" || warn "Could not merge VS Code settings"
+    else
+      cp "$CONFIG_DIR/vscode/machine-settings.json" "$VSCODE_DIR/settings.json"
+      fixed "Deployed VS Code machine settings"
+    fi
+  fi
+
+  # ── 4g. Learning data ──────────────────────────────────────────────
+  if [[ -d "$CONFIG_DIR/agent/learning" ]]; then
+    cp -ru "$CONFIG_DIR/agent/learning/"* "$NAMESPACE/.agent/learning/" 2>/dev/null
+    ok "Learning data deployed"
+  fi
+
+  # ── 4h. Baseline ───────────────────────────────────────────────────
+  if [[ -d "$CONFIG_DIR/baseline" ]]; then
+    cp -ru "$CONFIG_DIR/baseline/"* "$NAMESPACE/baseline/" 2>/dev/null
+    ok "Baseline deployed"
+  fi
 fi
-echo ""
 
-# ── 7. Sync AG settings/scratch ────────────────────────────────────
-log "Syncing AG settings..."
-mkdir -p ~/.gemini/antigravity/scratch
-rsync -az --timeout=30 \
-  "alex@${SOURCE_HOST}:~/.gemini/antigravity/scratch/" \
-  ~/.gemini/antigravity/scratch/ 2>/dev/null &&
-  ok "Scratch/settings synced" || warn "Scratch sync failed"
-echo ""
+# ═══════════════════════════════════════════════════════════════════════
+# PHASE 5: DATA SYNC (brains, knowledge, scratch — requires SSH)
+# ═══════════════════════════════════════════════════════════════════════
 
-# ── 8. Verify Syncthing for ongoing sync ───────────────────────────
-log "Checking Syncthing for continuous sync..."
-if systemctl --user is-active syncthing &>/dev/null; then
-  ok "Syncthing running (user service)"
-elif systemctl is-active syncthing@alex &>/dev/null; then
-  ok "Syncthing running (system service)"
-elif command -v syncthing &>/dev/null; then
-  warn "Syncthing installed but not running. Starting..."
-  systemctl --user enable syncthing 2>/dev/null || true
-  systemctl --user start syncthing 2>/dev/null || true
+step "Phase 5: Data Sync from $SOURCE"
+
+if [[ "$SSH_OK" == "true" ]]; then
+  # ── 5a. Scratch (todo, session_log, preferences) ──────────────────
+  log "Syncing scratch (todo, session_log, preferences)..."
+  rsync -az --timeout=30 \
+    "$USER@${SOURCE}:${NAMESPACE}/.gemini/antigravity/scratch/" \
+    "$NAMESPACE/.gemini/antigravity/scratch/" 2>/dev/null &&
+    fixed "Scratch synced" || failed "Scratch sync failed"
+
+  # ── 5b. Brains/conversations (into HOME, not NAMESPACE) ───────────
+  log "Syncing brains/conversations..."
+  BRAIN_COUNT_BEFORE=$(ls -1 "$HOME/.gemini/antigravity/brain/" 2>/dev/null | wc -l)
+  rsync -az --timeout=60 \
+    "$USER@${SOURCE}:$HOME/.gemini/antigravity/brain/" \
+    "$HOME/.gemini/antigravity/brain/" 2>/dev/null
+  BRAIN_COUNT_AFTER=$(ls -1 "$HOME/.gemini/antigravity/brain/" 2>/dev/null | wc -l)
+  BRAIN_NEW=$((BRAIN_COUNT_AFTER - BRAIN_COUNT_BEFORE))
+  if [[ $BRAIN_NEW -gt 0 ]]; then
+    fixed "Synced $BRAIN_NEW new conversations (total: $BRAIN_COUNT_AFTER)"
+  else
+    skipped "Brains already synced ($BRAIN_COUNT_AFTER conversations)"
+  fi
+
+  # ── 5c. Knowledge items ───────────────────────────────────────────
+  log "Syncing knowledge items..."
+  rsync -az --timeout=30 \
+    "$USER@${SOURCE}:$HOME/.gemini/antigravity/knowledge/" \
+    "$HOME/.gemini/antigravity/knowledge/" 2>/dev/null &&
+    ok "Knowledge synced: $(ls -1 "$HOME/.gemini/antigravity/knowledge/" 2>/dev/null | wc -l) items" ||
+    warn "Knowledge sync failed"
+
 else
-  warn "Syncthing not installed. Brains won't auto-sync."
+  warn "Skipping data sync — no SSH connectivity to $SOURCE"
+  warn "You can run this script again once Tailscale SSH is working"
 fi
-echo ""
 
-# ── Summary ─────────────────────────────────────────────────────────
-echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-echo -e "${BOLD}  Fix Summary${NC}"
-echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+# ═══════════════════════════════════════════════════════════════════════
+# PHASE 6: SERVICES (Docker, Syncthing)
+# ═══════════════════════════════════════════════════════════════════════
+
+step "Phase 6: Services"
+
+# ── 6a. Docker ───────────────────────────────────────────────────────
+if command -v docker &>/dev/null; then
+  if docker info &>/dev/null 2>&1; then
+    skipped "Docker running: $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')"
+  else
+    sudo systemctl start docker 2>/dev/null && fixed "Started Docker" || failed "Could not start Docker"
+  fi
+
+  # Docker network
+  NET="${DOCKER_NETWORK:-atn_bridge}"
+  if docker network inspect "$NET" &>/dev/null 2>&1; then
+    skipped "Docker network: $NET"
+  else
+    docker network create "$NET" 2>/dev/null && fixed "Created Docker network: $NET" || warn "Could not create $NET"
+  fi
+else
+  warn "Docker not installed"
+fi
+
+# ── 6b. Syncthing ───────────────────────────────────────────────────
+if command -v syncthing &>/dev/null; then
+  if systemctl --user is-active syncthing &>/dev/null 2>&1 ||
+    systemctl is-active "syncthing@$USER" &>/dev/null 2>&1; then
+    skipped "Syncthing running"
+  else
+    systemctl --user enable syncthing 2>/dev/null || true
+    systemctl --user start syncthing 2>/dev/null &&
+      fixed "Started Syncthing" || warn "Could not start Syncthing"
+  fi
+else
+  warn "Syncthing not installed"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════
+# SUMMARY
+# ═══════════════════════════════════════════════════════════════════════
+
+echo ""
+echo -e "${BOLD}══════════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}  Summary${NC}"
+echo -e "${BOLD}══════════════════════════════════════════════════════════${NC}"
+echo ""
+echo -e "  ${GREEN}Fixed:${NC}   $FIXES items"
+echo -e "  ${BLUE}Skipped:${NC} $SKIPS items (already OK)"
+[[ $FAILS -gt 0 ]] && echo -e "  ${RED}Failed:${NC}  $FAILS items"
 echo ""
 echo "  Hostname:       $(hostname)"
 echo "  Tailscale:      $(tailscale ip -4 2>/dev/null || echo 'N/A')"
 echo "  TS Hostname:    $(tailscale status --self --json 2>/dev/null | jq -r '.Self.HostName' 2>/dev/null || echo 'N/A')"
-echo "  Brains:         $(ls -1 ~/.gemini/antigravity/brain/ 2>/dev/null | wc -l) conversations"
-echo "  Knowledge:      $(ls -1 ~/.gemini/antigravity/knowledge/ 2>/dev/null | wc -l) items"
-echo "  Repos:          $(ls -1 /atn/github/ 2>/dev/null | wc -l) in /atn/github/"
-echo "  Rules:          $(ls -1 /atn/.agent/rules/ 2>/dev/null | wc -l) in /atn/.agent/rules/"
+echo "  SSH to source:  $([[ "$SSH_OK" == "true" ]] && echo "✓ $SOURCE" || echo "✗ not connected")"
+echo "  Brains:         $(ls -1 "$HOME/.gemini/antigravity/brain/" 2>/dev/null | wc -l) conversations"
+echo "  Knowledge:      $(ls -1 "$HOME/.gemini/antigravity/knowledge/" 2>/dev/null | wc -l) items"
+echo "  Repos:          $(find "$NAMESPACE/github" -maxdepth 1 -type d | wc -l) in /atn/github/"
+echo "  Rules:          $(find "$NAMESPACE/.agent/rules" -type f 2>/dev/null | wc -l)"
+echo "  Skills:         $(($(find "$NAMESPACE/.gemini/antigravity/skills" -maxdepth 1 -type d 2>/dev/null | wc -l) - 1))"
+echo "  Workflows:      $(find "$NAMESPACE/.gemini/antigravity/global_workflows" -type f 2>/dev/null | wc -l)"
+echo "  Docker:         $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo 'N/A')"
+echo "  Syncthing:      $(systemctl --user is-active syncthing 2>/dev/null || echo 'N/A')"
+echo ""
+
+if [[ $FAILS -gt 0 ]]; then
+  echo -e "  ${YELLOW}Re-run this script to retry failed items.${NC}"
+fi
 echo ""
