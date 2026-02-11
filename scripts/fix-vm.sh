@@ -28,15 +28,15 @@ FIXES=0
 SKIPS=0
 FAILS=0
 fixed() {
-  ((FIXES++))
+  ((FIXES++)) || true
   ok "$*"
 }
 skipped() {
-  ((SKIPS++))
+  ((SKIPS++)) || true
   ok "$* (already done)"
 }
 failed() {
-  ((FAILS++))
+  ((FAILS++)) || true
   err "$*"
 }
 
@@ -106,7 +106,7 @@ for d in \
   "$NAMESPACE"/{baseline,github,bin,logs,scripts,config,tmp,appdata,.config,.github,.venv}; do
   if [[ ! -d "$d" ]]; then
     mkdir -p "$d"
-    ((DIRS_NEEDED++))
+    ((DIRS_NEEDED++)) || true
   fi
 done
 if [[ $DIRS_NEEDED -gt 0 ]]; then
