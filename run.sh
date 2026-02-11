@@ -139,6 +139,197 @@ install_bws() {
   fi
 }
 
+# ─── BWS: Initialize and cache all secrets ───────────────────────────────
+BWS_SECRETS_JSON=""
+
+_bws_init_secrets() {
+  # Already initialized?
+  if [[ -n "$BWS_SECRETS_JSON" && "$BWS_SECRETS_JSON" != "[]" ]]; then
+    return 0
+  fi
+
+  # Fetch secrets — with automatic v1/v2 token compatibility fallback
+  BWS_SECRETS_JSON="$(bws secret list -o json 2>"$SETUP_TMPDIR/.bws_err" || true)"
+
+  # If we get the "decryption key" error, the token format doesn't match the CLI version
+  if [[ -z "$BWS_SECRETS_JSON" ]] && grep -qi "decryption key" "$SETUP_TMPDIR/.bws_err" 2>/dev/null; then
+    local current_ver
+    current_ver="$(bws --version 2>/dev/null | awk '{print $NF}' || echo 'unknown')"
+    if [[ "$current_ver" == 2.* ]]; then
+      warn "BWS v2 can't decrypt your token — your token uses v1 format."
+      warn "Auto-installing BWS v1.0.0 for compatibility..."
+      install_bws "1.0.0" "--force" || true
+      BWS_SECRETS_JSON="$(bws secret list -o json 2>"$SETUP_TMPDIR/.bws_err" || true)"
+    elif [[ "$current_ver" == 1.* || "$current_ver" == 0.* ]]; then
+      warn "BWS v1 can't decrypt your token — your token may use v2 format."
+      warn "Auto-installing BWS v2.0.0 for compatibility..."
+      install_bws "2.0.0" "--force" || true
+      BWS_SECRETS_JSON="$(bws secret list -o json 2>"$SETUP_TMPDIR/.bws_err" || true)"
+    fi
+  fi
+
+  # Also try project-scoped listing
+  local project_secrets=""
+  project_secrets="$(bws project list -o json 2>/dev/null || echo '[]')"
+  if [[ -n "$project_secrets" && "$project_secrets" != "[]" ]]; then
+    local project_ids
+    project_ids="$(echo "$project_secrets" | jq -r '.[].id' 2>/dev/null || true)"
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      local proj_secrets
+      proj_secrets="$(bws secret list --project-id "$pid" -o json 2>/dev/null || true)"
+      if [[ -n "$proj_secrets" && "$proj_secrets" != "[]" ]]; then
+        if [[ -z "$BWS_SECRETS_JSON" || "$BWS_SECRETS_JSON" == "[]" ]]; then
+          BWS_SECRETS_JSON="$proj_secrets"
+        else
+          BWS_SECRETS_JSON="$(echo "$BWS_SECRETS_JSON $proj_secrets" | jq -s 'add | unique_by(.id)' 2>/dev/null || echo "$BWS_SECRETS_JSON")"
+        fi
+      fi
+    done <<<"$project_ids"
+  fi
+
+  if [[ -z "$BWS_SECRETS_JSON" || "$BWS_SECRETS_JSON" == "[]" ]]; then
+    err "BWS secret list returned no data."
+    [[ -s "$SETUP_TMPDIR/.bws_err" ]] && err "BWS error: $(cat "$SETUP_TMPDIR/.bws_err")"
+    return 1
+  fi
+
+  return 0
+}
+
+# ─── BWS: Find a secret by exact name or fuzzy keywords ──────────────────
+# Usage: _bws_find_secret "$json" "EXACT_NAME" "keyword1" "keyword2" ...
+# Returns: the secret value, or empty string
+_bws_find_secret() {
+  local json="$1"
+  local exact_name="$2"
+  shift 2
+  local keywords=("$@")
+
+  # Strategy 1: Exact match
+  local val
+  val="$(echo "$json" | jq -r --arg name "$exact_name" \
+    '.[] | select(.key == $name) | .value' 2>/dev/null | head -1)"
+  [[ -n "$val" ]] && echo "$val" && return 0
+
+  # Strategy 2: Case-insensitive exact match
+  val="$(echo "$json" | jq -r --arg name "$exact_name" \
+    '.[] | select(.key | ascii_downcase == ($name | ascii_downcase)) | .value' 2>/dev/null | head -1)"
+  [[ -n "$val" ]] && echo "$val" && return 0
+
+  # Strategy 3: Fuzzy keyword match
+  if [[ ${#keywords[@]} -gt 0 ]]; then
+    local kw_filter=""
+    for kw in "${keywords[@]}"; do
+      if [[ -n "$kw_filter" ]]; then
+        kw_filter="$kw_filter or (\$k | contains(\"$kw\"))"
+      else
+        kw_filter="(\$k | contains(\"$kw\"))"
+      fi
+    done
+
+    val="$(echo "$json" | jq -r --argjson dummy 0 "
+      [.[] | select((.key | ascii_downcase) as \$k | $kw_filter)]
+      | .[0].value // empty
+    " 2>/dev/null || true)"
+    [[ -n "$val" ]] && echo "$val" && return 0
+  fi
+
+  return 1
+}
+
+# ─── Detect Environment (OCI/Cloud vs VM vs Bare Metal) ──────────────────
+MACHINE_TYPE=""     # "cloud", "vm", or "bare"
+MACHINE_HOSTNAME="" # e.g. "vps1", "vm2"
+
+detect_environment() {
+  local vendor=""
+  if [[ -r /sys/class/dmi/id/sys_vendor ]]; then
+    vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
+  fi
+
+  # Classify environment
+  case "${vendor,,}" in
+  *oracle* | *oraclecloud*) MACHINE_TYPE="cloud" ;;
+  *amazon* | *xen* | *aws*) MACHINE_TYPE="cloud" ;;
+  *google*) MACHINE_TYPE="cloud" ;;
+  *digitalocean*) MACHINE_TYPE="cloud" ;;
+  *hetzner*) MACHINE_TYPE="cloud" ;;
+  *linode* | *akamai*) MACHINE_TYPE="cloud" ;;
+  *vmware*) MACHINE_TYPE="vm" ;;
+  *innotek* | *virtualbox*) MACHINE_TYPE="vm" ;;
+  *parallels*) MACHINE_TYPE="vm" ;;
+  *qemu* | *kvm* | *bochs*) MACHINE_TYPE="vm" ;;
+  *microsoft*)
+    # Azure = cloud, Hyper-V = vm
+    if grep -qi "azure" /sys/class/dmi/id/product_name 2>/dev/null; then
+      MACHINE_TYPE="cloud"
+    else
+      MACHINE_TYPE="vm"
+    fi
+    ;;
+  *)
+    # Check for VM via hypervisor
+    if [[ -d /proc/xen ]] || grep -qi "hypervisor" /proc/cpuinfo 2>/dev/null; then
+      MACHINE_TYPE="vm"
+    else
+      MACHINE_TYPE="bare"
+    fi
+    ;;
+  esac
+
+  # Determine hostname prefix
+  local prefix
+  case "$MACHINE_TYPE" in
+  cloud) prefix="vps" ;;
+  vm) prefix="vm" ;;
+  bare) prefix="srv" ;;
+  esac
+
+  # Find next available number
+  local num=1
+  local current_host
+  current_host="$(hostname 2>/dev/null || echo '')"
+
+  # If current hostname already matches our pattern, keep it
+  if [[ "$current_host" =~ ^(vps|vm|srv)[0-9]+$ ]]; then
+    MACHINE_HOSTNAME="$current_host"
+    log "Environment: $MACHINE_TYPE (vendor: ${vendor:-unknown}) — hostname: $MACHINE_HOSTNAME"
+    return 0
+  fi
+
+  # Check existing Tailscale nodes to avoid conflicts
+  local existing_names=""
+  if command -v tailscale &>/dev/null && tailscale status &>/dev/null 2>&1; then
+    existing_names="$(tailscale status --json 2>/dev/null | jq -r '.Peer[].HostName // empty' 2>/dev/null || true)"
+  fi
+
+  while true; do
+    local candidate="${prefix}${num}"
+    if ! echo "$existing_names" | grep -qx "$candidate"; then
+      MACHINE_HOSTNAME="$candidate"
+      break
+    fi
+    ((num++))
+  done
+
+  log "Environment: $MACHINE_TYPE (vendor: ${vendor:-unknown}) — assigning hostname: $MACHINE_HOSTNAME"
+
+  # Set the system hostname
+  sudo hostnamectl set-hostname "$MACHINE_HOSTNAME" 2>/dev/null ||
+    sudo hostname "$MACHINE_HOSTNAME" 2>/dev/null || true
+
+  # Update /etc/hostname
+  echo "$MACHINE_HOSTNAME" | sudo tee /etc/hostname >/dev/null 2>&1 || true
+
+  # Ensure /etc/hosts has the new hostname
+  if ! grep -q "$MACHINE_HOSTNAME" /etc/hosts 2>/dev/null; then
+    echo "127.0.1.1 $MACHINE_HOSTNAME" | sudo tee -a /etc/hosts >/dev/null 2>&1 || true
+  fi
+
+  ok "Hostname set to $MACHINE_HOSTNAME"
+}
+
 # ─── Check GitHub SSH access ────────────────────────────────────────────
 check_github_ssh() {
   log "Checking GitHub SSH access..."
@@ -227,105 +418,31 @@ resolve_github_access() {
 
   export BWS_ACCESS_TOKEN
 
-  # Fetch GitHub PAT from BWS
-  # BWS_ACCESS_TOKEN is already exported — bws picks it up automatically
-  log "Fetching GitHub PAT from BWS (secret: $BWS_SECRET_NAME_GH_PAT)..."
-  local pat="" bws_json=""
-
-  # Fetch secrets — with automatic v1/v2 token compatibility fallback
-  bws_json="$(bws secret list -o json 2>"$SETUP_TMPDIR/.bws_err" || true)"
-
-  # If we get the "decryption key" error, the token format doesn't match the CLI version
-  if [[ -z "$bws_json" ]] && grep -qi "decryption key" "$SETUP_TMPDIR/.bws_err" 2>/dev/null; then
-    local current_ver
-    current_ver="$(bws --version 2>/dev/null | awk '{print $NF}' || echo 'unknown')"
-    if [[ "$current_ver" == 2.* ]]; then
-      warn "BWS v2 can't decrypt your token — your token uses v1 format."
-      warn "Auto-installing BWS v1.0.0 for compatibility..."
-      install_bws "1.0.0" "--force" || true
-      bws_json="$(bws secret list -o json 2>"$SETUP_TMPDIR/.bws_err" || true)"
-    elif [[ "$current_ver" == 1.* || "$current_ver" == 0.* ]]; then
-      warn "BWS v1 can't decrypt your token — your token may use v2 format."
-      warn "Auto-installing BWS v2.0.0 for compatibility..."
-      install_bws "2.0.0" "--force" || true
-      bws_json="$(bws secret list -o json 2>"$SETUP_TMPDIR/.bws_err" || true)"
-    fi
-  fi
-
-  # Also try project-scoped listing if the above returned empty or few results
-  local project_secrets=""
-  project_secrets="$(bws project list -o json 2>/dev/null || echo '[]')"
-  if [[ -n "$project_secrets" && "$project_secrets" != "[]" ]]; then
-    local project_ids
-    project_ids="$(echo "$project_secrets" | jq -r '.[].id' 2>/dev/null || true)"
-    while IFS= read -r pid; do
-      [[ -z "$pid" ]] && continue
-      local proj_secrets
-      proj_secrets="$(bws secret list --project-id "$pid" -o json 2>/dev/null || true)"
-      if [[ -n "$proj_secrets" && "$proj_secrets" != "[]" ]]; then
-        # Merge into main JSON array
-        if [[ -z "$bws_json" || "$bws_json" == "[]" ]]; then
-          bws_json="$proj_secrets"
-        else
-          bws_json="$(echo "$bws_json $proj_secrets" | jq -s 'add | unique_by(.id)' 2>/dev/null || echo "$bws_json")"
-        fi
-      fi
-    done <<<"$project_ids"
-  fi
-
-  if [[ -z "$bws_json" || "$bws_json" == "[]" ]]; then
-    err "BWS secret list returned no data."
-    [[ -s "$SETUP_TMPDIR/.bws_err" ]] && err "BWS error: $(cat "$SETUP_TMPDIR/.bws_err")"
+  # Initialize BWS secrets cache (shared with other consumers like Tailscale)
+  log "Fetching secrets from BWS..."
+  if ! _bws_init_secrets; then
     die "Check your BWS access token."
   fi
 
-  # Strategy 1: Exact match on configured name
-  pat="$(echo "$bws_json" | jq -r --arg name "$BWS_SECRET_NAME_GH_PAT" \
-    '.[] | select(.key == $name) | .value' 2>/dev/null | head -1)"
+  # Fetch GitHub PAT using the shared finder
+  log "Looking for GitHub PAT (preferred name: $BWS_SECRET_NAME_GH_PAT)..."
+  local pat=""
 
-  # Strategy 2: Case-insensitive exact match
-  if [[ -z "$pat" ]]; then
-    pat="$(echo "$bws_json" | jq -r --arg name "$BWS_SECRET_NAME_GH_PAT" \
-      '.[] | select(.key | ascii_downcase == ($name | ascii_downcase)) | .value' 2>/dev/null | head -1)"
+  # Try exact/fuzzy match via shared helper
+  pat="$(_bws_find_secret "$BWS_SECRETS_JSON" "$BWS_SECRET_NAME_GH_PAT" \
+    "github" "gh_pat" "personal_access" "pat")" || true
+
+  # Validate: does it look like a GitHub PAT?
+  if [[ -n "$pat" ]] && ! [[ "$pat" =~ ^(ghp_|github_pat_|gho_) ]] && [[ ${#pat} -lt 30 ]]; then
+    warn "Found a secret but it doesn't look like a GitHub PAT. Scanning all secrets..."
+    pat=""
   fi
 
-  # Strategy 3: Fuzzy keyword match — find secrets with github/pat/token in the name
+  # Last resort: scan ALL secrets for GitHub PAT format
   if [[ -z "$pat" ]]; then
-    log "Exact match not found. Searching for GitHub PAT by keyword..."
-    local candidates
-    candidates="$(echo "$bws_json" | jq -r '
-      [.[] | select(
-        (.key | ascii_downcase) as $k |
-        ($k | contains("github")) or
-        ($k | contains("gh_pat")) or
-        ($k | contains("personal_access")) or
-        (($k | contains("pat")) and (($k | contains("git")) or ($k | contains("hub"))))
-      )] | sort_by(
-        # Score: prefer keys with more matching terms (lower = better)
-        (.key | ascii_downcase) as $k |
-        (if ($k | contains("github")) and ($k | contains("pat") or contains("personal_access_token")) then 0
-         elif ($k | contains("github")) and ($k | contains("token")) then 1
-         elif $k == "github_pat" or $k == "github" then 2
-         else 3 end)
-      ) | .[] | "\(.key)\t\(.value)"
-    ' 2>/dev/null || true)"
-
-    # Check each candidate — verify value looks like a GitHub PAT
-    while IFS=$'\t' read -r secret_key secret_val; do
-      [[ -z "$secret_key" ]] && continue
-      if [[ "$secret_val" =~ ^(ghp_|github_pat_|gho_) ]] || [[ ${#secret_val} -ge 30 ]]; then
-        log "Found likely GitHub PAT in secret '$secret_key'"
-        pat="$secret_val"
-        break
-      fi
-    done <<<"$candidates"
-  fi
-
-  # Strategy 4: Last resort — check ALL secrets for values that look like GitHub PATs
-  if [[ -z "$pat" ]]; then
-    log "No keyword matches. Scanning all secrets for GitHub PAT format..."
+    log "Scanning all secrets for GitHub PAT format..."
     local all_vals
-    all_vals="$(echo "$bws_json" | jq -r '.[] | "\(.key)\t\(.value)"' 2>/dev/null || true)"
+    all_vals="$(echo "$BWS_SECRETS_JSON" | jq -r '.[] | "\(.key)\t\(.value)"' 2>/dev/null || true)"
     while IFS=$'\t' read -r secret_key secret_val; do
       [[ -z "$secret_key" ]] && continue
       if [[ "$secret_val" =~ ^(ghp_|github_pat_|gho_) ]]; then
@@ -338,8 +455,8 @@ resolve_github_access() {
 
   if [[ -z "$pat" ]]; then
     err "Could not find a GitHub PAT in any BWS secret."
-    warn "Available secrets ($(echo "$bws_json" | jq 'length' 2>/dev/null || echo '?') total):"
-    echo "$bws_json" | jq -r '.[].key' 2>/dev/null | while read -r k; do
+    warn "Available secrets ($(echo "$BWS_SECRETS_JSON" | jq 'length' 2>/dev/null || echo '?') total):"
+    echo "$BWS_SECRETS_JSON" | jq -r '.[].key' 2>/dev/null | while read -r k; do
       warn "  • $k"
     done
     echo ""
@@ -400,22 +517,56 @@ _post_bootstrap_menu() {
       action_labels+=("Authenticate GitHub CLI")
       action_funcs+=("_action_gh_auth")
     fi
-
-    # bashrc not sourced (check if NAMESPACE is in current env)
-    if ! grep -q "NAMESPACE" <(env 2>/dev/null) || [[ -z "${NAMESPACE_SOURCED:-}" ]]; then
-      actions+=("bashrc")
-      action_labels+=("Reload shell environment (source ~/.bashrc)")
-      action_funcs+=("_action_bashrc")
-    fi
   }
 
   # ── Action handlers ─────────────────────────────────────────────────
   _action_tailscale() {
     echo ""
-    log "Starting Tailscale authentication..."
-    echo -e "  ${BOLD}This will open Tailscale login. Follow the URL to authenticate.${NC}"
+
+    # Try to get auth key from BWS first
+    if [[ -n "${BWS_SECRETS_JSON:-}" ]]; then
+      local ts_key
+      ts_key="$(_bws_find_secret "$BWS_SECRETS_JSON" "TAILSCALE_AUTH_KEY" "tailscale" "authkey" "auth_key" "ts_auth")"
+      if [[ -n "$ts_key" && "$ts_key" == tskey-auth-* ]]; then
+        log "Found Tailscale auth key in BWS — authenticating automatically..."
+        if sudo tailscale up --authkey="$ts_key" --accept-routes --ssh --hostname="${MACHINE_HOSTNAME:-}" 2>&1; then
+          ok "Tailscale authenticated automatically! IP: $(tailscale ip -4 2>/dev/null)"
+          echo ""
+          return
+        fi
+        warn "Auto-auth with BWS key failed, falling back to interactive..."
+      fi
+
+      # Try generating an auth key via Tailscale API
+      local ts_api_key
+      ts_api_key="$(_bws_find_secret "$BWS_SECRETS_JSON" "TAILSCALE_API_KEY" "tailscale_api" "ts_api")"
+      if [[ -n "$ts_api_key" ]]; then
+        log "Found Tailscale API key in BWS — generating auth key..."
+        local gen_key
+        gen_key="$(curl -fsSL -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+          -u "$ts_api_key:" \
+          -H 'Content-Type: application/json' \
+          -d '{"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":false,"preauthorized":true,"tags":["tag:server"]}}},"expirySeconds":300}' \
+          2>/dev/null | jq -r '.key // empty' 2>/dev/null || true)"
+        if [[ -n "$gen_key" ]]; then
+          log "Generated one-time pre-authorized auth key"
+          if sudo tailscale up --authkey="$gen_key" --accept-routes --ssh --hostname="${MACHINE_HOSTNAME:-}" 2>&1; then
+            ok "Tailscale authenticated via generated key! IP: $(tailscale ip -4 2>/dev/null)"
+            echo ""
+            return
+          fi
+          warn "Generated key auth failed, falling back to interactive..."
+        else
+          warn "Could not generate auth key via API — check your TAILSCALE_API_KEY."
+        fi
+      fi
+    fi
+
+    # Fallback: interactive
+    log "Starting Tailscale authentication (interactive)..."
+    echo -e "  ${BOLD}Follow the URL below to authenticate.${NC}"
     echo ""
-    if sudo tailscale up 2>&1; then
+    if sudo tailscale up --accept-routes --ssh --hostname="${MACHINE_HOSTNAME:-}" 2>&1; then
       ok "Tailscale authenticated! IP: $(tailscale ip -4 2>/dev/null)"
     else
       warn "Tailscale authentication was cancelled or failed."
@@ -440,15 +591,7 @@ _post_bootstrap_menu() {
     echo ""
   }
 
-  _action_bashrc() {
-    echo ""
-    log "Reloading shell environment..."
-    # shellcheck disable=SC1090
-    source ~/.bashrc 2>/dev/null || true
-    export NAMESPACE_SOURCED=1
-    ok "Shell environment reloaded"
-    echo ""
-  }
+  # bashrc is now reloaded automatically — no menu item needed
 
   # ── Menu loop ───────────────────────────────────────────────────────
   while true; do
@@ -481,9 +624,8 @@ _post_bootstrap_menu() {
       echo -e "  ${YELLOW}Skipped remaining actions.${NC} You can run them later:"
       for idx in "${!actions[@]}"; do
         case "${actions[$idx]}" in
-        tailscale) echo "    • sudo tailscale up" ;;
+        tailscale) echo "    • sudo tailscale up --accept-routes --ssh" ;;
         gh_auth) echo "    • gh auth login" ;;
-        bashrc) echo "    • source ~/.bashrc" ;;
         esac
       done
       echo ""
@@ -517,6 +659,9 @@ main() {
   [[ "$OS_ID" == "debian" || "$OS_ID" == "ubuntu" ]] || die "Only Debian/Ubuntu supported (got: $OS_ID)"
 
   install_base
+
+  # Detect environment type (OCI/cloud/VM/bare) and set hostname
+  detect_environment
 
   # Create namespace
   sudo mkdir -p "$NAMESPACE" "$LOG_DIR"
@@ -565,6 +710,8 @@ main() {
   echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
   echo ""
   echo "  Namespace:  $NAMESPACE"
+  echo "  Hostname:   ${MACHINE_HOSTNAME:-$(hostname)}"
+  echo "  Type:       ${MACHINE_TYPE:-unknown}"
   echo "  Run log:    $run_dir/"
   echo "  OS:         $OS_ID $OS_VERSION"
   echo ""
@@ -584,6 +731,14 @@ main() {
 
   # ─── Interactive post-bootstrap menu ─────────────────────────────────
   _post_bootstrap_menu
+
+  # ─── Auto-reload shell environment ──────────────────────────────────
+  log "Reloading shell environment..."
+  # shellcheck disable=SC1090
+  source ~/.bashrc 2>/dev/null || true
+  export NAMESPACE_SOURCED=1
+  ok "Shell environment reloaded"
+  echo ""
 
   # Cleanup is handled by the EXIT trap (see cleanup() above)
 }

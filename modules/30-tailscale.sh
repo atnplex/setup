@@ -4,8 +4,8 @@ MODULE_ORDER=30
 
 module_supports_os() {
   case "$OS_ID" in
-    ubuntu|debian|fedora|centos|rhel) return 0 ;;
-    *) return 1 ;;
+  ubuntu | debian | fedora | centos | rhel) return 0 ;;
+  *) return 1 ;;
   esac
 }
 
@@ -29,5 +29,5 @@ module_run() {
     return 0
   fi
 
-  sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --accept-routes --ssh || true
+  sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --accept-routes --accept-dns --ssh --hostname="${MACHINE_HOSTNAME:-}" || true
 }
