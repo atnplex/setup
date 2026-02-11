@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 #
-# ATN Server Bootstrap — Modular Entry Point
+# Server Bootstrap — Modular Entry Point
 #
-# One-liner: curl -fsSL https://raw.githubusercontent.com/atnplex/setup/main/run.sh | bash
-# With args: curl -fsSL ... | bash -s -- --non-interactive --module docker --module tailscale
+# One-liner (private repo, requires gh auth):
+#   curl -fsSL https://raw.githubusercontent.com/${GH_ORG}/setup/main/run.sh | bash
 #
-# This script:
-#   1. Clones the setup repo (if not already cloned)
-#   2. Sources the core library and registry
-#   3. Runs all modules in order (or selected ones via --module flags)
+# With args:
+#   curl -fsSL ... | bash -s -- --non-interactive --module docker --module tailscale
 #
-# Environment variables (all optional, derived if not set):
-#   NAMESPACE    — Root namespace (default: /atn)
+# Environment variables (all optional, derived from defaults.env):
+#   NAMESPACE        — Root namespace path
+#   GH_ORG           — GitHub organization
 #   SYNC_SOURCE      — Hostname or IP of server to sync state from
 #   SYNC_BRAIN       — "true"/"false" to sync recent brain data (default: true)
 #   GITHUB_PERSONAL_ACCESS_TOKEN — For gh auth + GitHub MCP
@@ -19,21 +18,34 @@
 #
 set -euo pipefail
 
-# Derive namespace
-NAMESPACE="${NAMESPACE:-/atn}"
-SETUP_REPO_DIR="${NAMESPACE}/github/setup"
-LOG_DIR="${NAMESPACE}/logs"
-RUN_LOG="${LOG_DIR}/bootstrap-$(date -u +%Y%m%dT%H%M%SZ).log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# Load defaults (single source of truth for all default values)
+load_defaults() {
+  if [[ -f "$SCRIPT_DIR/defaults.env" ]]; then
+    # shellcheck source=defaults.env
+    source "$SCRIPT_DIR/defaults.env"
+  elif [[ -f "${SETUP_REPO_DIR:-}/defaults.env" ]]; then
+    source "${SETUP_REPO_DIR}/defaults.env"
+  else
+    # Minimal fallback when running via curl|bash before repo is cloned
+    NAMESPACE="${NAMESPACE:-/atn}"
+    GH_ORG="${GH_ORG:-atnplex}"
+    DOCKER_NETWORK="${DOCKER_NETWORK:-atn_bridge}"
+  fi
+  LOG_DIR="${LOG_DIR:-${NAMESPACE}/logs}"
+  SETUP_REPO_DIR="${SETUP_REPO_DIR:-${NAMESPACE}/github/setup}"
+}
+
 banner() {
   echo ""
   echo -e "${BLUE}╔═══════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BLUE}║         ATN Server Bootstrap (Modular)               ║${NC}"
+  echo -e "${BLUE}║            Server Bootstrap (Modular)                ║${NC}"
   echo -e "${BLUE}╚═══════════════════════════════════════════════════════╝${NC}"
   echo ""
 }
@@ -45,7 +57,7 @@ ensure_base() {
     command -v "$cmd" &>/dev/null || missing+=("$cmd")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
-    echo -e "${BLUE}[ATN]${NC} Installing base dependencies: ${missing[*]}"
+    echo -e "${BLUE}[SETUP]${NC} Installing base dependencies: ${missing[*]}"
     sudo apt-get update -qq 2>/dev/null
     sudo apt-get install -y -qq curl git python3 rsync jq unzip ca-certificates gnupg lsb-release 2>/dev/null
   fi
@@ -58,19 +70,24 @@ ensure_repo() {
     echo -e "${GREEN}[✓]${NC} Setup repo exists at $SETUP_REPO_DIR"
     cd "$SETUP_REPO_DIR" && git pull --quiet 2>/dev/null || true
   else
-    echo -e "${BLUE}[ATN]${NC} Cloning setup repo..."
+    echo -e "${BLUE}[SETUP]${NC} Cloning setup repo..."
     if command -v gh &>/dev/null && gh auth status &>/dev/null; then
-      gh repo clone atnplex/setup "$SETUP_REPO_DIR" -- --quiet
+      gh repo clone "${GH_ORG}/setup" "$SETUP_REPO_DIR" -- --quiet
     else
-      git clone https://github.com/atnplex/setup.git "$SETUP_REPO_DIR" 2>/dev/null || {
+      git clone "https://github.com/${GH_ORG}/setup.git" "$SETUP_REPO_DIR" 2>/dev/null || {
         echo -e "${RED}[✗]${NC} Failed to clone repo. Ensure gh auth or SSH key is configured."
         exit 1
       }
     fi
   fi
+  # Re-source defaults from cloned repo (now has full defaults.env)
+  if [[ -f "$SETUP_REPO_DIR/defaults.env" ]]; then
+    source "$SETUP_REPO_DIR/defaults.env"
+  fi
 }
 
 main() {
+  load_defaults
   banner
 
   # Create namespace root
@@ -81,8 +98,7 @@ main() {
   ensure_repo
 
   cd "$SETUP_REPO_DIR"
-  export SETUP_REPO_DIR
-  export NAMESPACE
+  export SETUP_REPO_DIR NAMESPACE GH_ORG DOCKER_NETWORK LOG_DIR
 
   # Source the modular system
   # shellcheck source=lib/core.sh
@@ -112,7 +128,7 @@ main() {
 
   echo ""
   echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
-  echo -e "${GREEN}  ATN Bootstrap Complete!${NC}"
+  echo -e "${GREEN}  Bootstrap Complete!${NC}"
   echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
   echo ""
   echo "  Namespace: $NAMESPACE"

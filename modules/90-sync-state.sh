@@ -10,7 +10,7 @@ module_interactive_prompt() {
 }
 
 module_run() {
-  local atn_root="${NAMESPACE:-/atn}"
+  local atn_root="${NAMESPACE:?NAMESPACE must be set (source defaults.env)}"
   local scratch_dir="$atn_root/.gemini/antigravity/scratch"
   local brain_dir="$atn_root/.gemini/antigravity/brain"
 

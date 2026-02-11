@@ -25,10 +25,11 @@ module_run() {
   sudo systemctl start docker
 
   # Create default bridge network
-  if docker network inspect atn_bridge &>/dev/null; then
-    log_info "Docker network atn_bridge already exists"
+  local net="${DOCKER_NETWORK:-atn_bridge}"
+  if docker network inspect "$net" &>/dev/null; then
+    log_info "Docker network $net already exists"
   else
-    docker network create atn_bridge
-    log_info "Created Docker network: atn_bridge"
+    docker network create "$net"
+    log_info "Created Docker network: $net"
   fi
 }

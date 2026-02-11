@@ -8,7 +8,7 @@ module_requires_root() { return 1; } # Does not require root
 module_run() {
   local setup_repo="${SETUP_REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   local config_dir="${setup_repo}/config"
-  local atn_root="${NAMESPACE:-/atn}"
+  local atn_root="${NAMESPACE:?NAMESPACE must be set (source defaults.env)}"
 
   if [[ ! -d "$config_dir" ]]; then
     log_error "Config directory not found: $config_dir"
@@ -17,7 +17,7 @@ module_run() {
 
   log_info "Deploying agent config from $config_dir to $atn_root..."
 
-  # Create /atn namespace directory structure
+  # Create namespace directory structure
   local dirs=(
     "$atn_root/.gemini/antigravity/skills"
     "$atn_root/.gemini/antigravity/global_workflows"
@@ -34,7 +34,7 @@ module_run() {
   for d in "${dirs[@]}"; do
     mkdir -p "$d"
   done
-  log_info "Created /atn namespace directory structure"
+  log_info "Created $NAMESPACE namespace directory structure"
 
   # Deploy GEMINI.md (global rules entry point)
   if [[ -f "$config_dir/gemini/GEMINI.md" ]]; then
