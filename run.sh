@@ -41,6 +41,24 @@ BWS_SECRET_NAME_GH_PAT="${BWS_SECRET_NAME_GH_PAT:-GITHUB_PERSONAL_ACCESS_TOKEN}"
 
 export NAMESPACE GH_ORG DOCKER_NETWORK SETUP_REPO_DIR LOG_DIR
 
+# ─── Temp workspace (tmpfs-backed, auto-cleaned) ────────────────────────
+SETUP_TMPDIR=""
+cleanup() {
+  if [[ -n "$SETUP_TMPDIR" && -d "$SETUP_TMPDIR" ]]; then
+    rm -rf "$SETUP_TMPDIR"
+  fi
+  # Clear sensitive variables
+  unset BWS_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+# Prefer tmpfs (/dev/shm) for in-memory temp files, fall back to /tmp
+if [[ -d /dev/shm && -w /dev/shm ]]; then
+  SETUP_TMPDIR="$(mktemp -d /dev/shm/atn-setup.XXXXXX)"
+else
+  SETUP_TMPDIR="$(mktemp -d /tmp/atn-setup.XXXXXX)"
+fi
+
 # ─── Detect OS ───────────────────────────────────────────────────────────
 detect_os() {
   if [[ -f /etc/os-release ]]; then
@@ -95,25 +113,22 @@ install_bws() {
 
   # Download from bitwarden/sdk-sm (where release binaries are hosted)
   local url="https://github.com/bitwarden/sdk-sm/releases/download/bws-v${bws_version}/bws-${arch}-unknown-linux-gnu-${bws_version}.zip"
-  local tmp_dir
-  tmp_dir="$(mktemp -d)"
+  local dl_dir="$SETUP_TMPDIR/bws"
+  mkdir -p "$dl_dir"
   log "Downloading from: $url"
-  if curl -fsSL "$url" -o "$tmp_dir/bws.zip"; then
-    unzip -q "$tmp_dir/bws.zip" -d "$tmp_dir"
+  if curl -fsSL "$url" -o "$dl_dir/bws.zip"; then
+    unzip -q "$dl_dir/bws.zip" -d "$dl_dir"
     # Find the bws binary (might be in a subdirectory)
     local bws_bin
-    bws_bin="$(find "$tmp_dir" -name 'bws' -type f | head -1)"
+    bws_bin="$(find "$dl_dir" -name 'bws' -type f | head -1)"
     if [[ -n "$bws_bin" ]]; then
       sudo install -m 755 "$bws_bin" /usr/local/bin/bws
-      rm -rf "$tmp_dir"
       ok "BWS CLI $bws_version installed"
     else
-      rm -rf "$tmp_dir"
       err "BWS binary not found in downloaded archive"
       return 1
     fi
   else
-    rm -rf "$tmp_dir"
     err "Failed to download BWS CLI from $url"
     return 1
   fi
@@ -312,8 +327,7 @@ main() {
   echo "    3. Open VS Code → Remote SSH → $(hostname)"
   echo ""
 
-  # Clear sensitive variables from memory
-  unset BWS_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN 2>/dev/null || true
+  # Cleanup is handled by the EXIT trap (see cleanup() above)
 }
 
 main "$@"
