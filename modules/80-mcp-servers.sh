@@ -17,7 +17,7 @@ module_run() {
     return 1
   fi
 
-  log_info "Pulling MCP Docker images..."
+  log_info "Checking MCP Docker images..."
 
   local images=(
     "mcp/filesystem"
@@ -29,20 +29,22 @@ module_run() {
     "mcp/playwright"
   )
 
-  local failed=0
+  local pulled=0 skipped=0 failed=0
   for img in "${images[@]}"; do
-    log_info "Pulling $img..."
-    if docker pull "$img" 2>&1 | tail -1; then
-      log_info "Pulled $img"
+    # Check if image already exists locally
+    if docker image inspect "$img" &>/dev/null; then
+      log_info "Image $img already present — skipping"
+      ((skipped++))
     else
-      log_warn "Failed to pull $img"
-      ((failed++)) || true
+      log_info "Pulling $img..."
+      if docker pull "$img" 2>&1 | tail -1; then
+        ((pulled++))
+      else
+        log_warn "Failed to pull $img"
+        ((failed++))
+      fi
     fi
   done
 
-  if [[ $failed -gt 0 ]]; then
-    log_warn "$failed MCP images failed to pull"
-  else
-    log_info "All MCP images pulled successfully"
-  fi
+  log_info "MCP images: $pulled pulled, $skipped already present, $failed failed"
 }
