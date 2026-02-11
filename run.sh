@@ -1,148 +1,293 @@
 #!/usr/bin/env bash
 #
-# Server Bootstrap — Modular Entry Point
+# Server Bootstrap — Single Command Setup
 #
-# One-liner (private repo, requires gh auth):
-#   curl -fsSL https://raw.githubusercontent.com/${GH_ORG}/setup/main/run.sh | bash
+# Usage (fresh Debian VM — public repo):
+#   curl -fsSL https://raw.githubusercontent.com/atnplex/setup/main/run.sh | bash
 #
-# With args:
-#   curl -fsSL ... | bash -s -- --non-interactive --module docker --module tailscale
+# Usage (with pre-set tokens):
+#   export BWS_ACCESS_TOKEN=... GH_TOKEN=ghp_...
+#   curl -fsSL https://raw.githubusercontent.com/atnplex/setup/main/run.sh | bash
 #
-# Environment variables (all optional, derived from defaults.env):
-#   NAMESPACE        — Root namespace path
-#   GH_ORG           — GitHub organization
-#   SYNC_SOURCE      — Hostname or IP of server to sync state from
-#   SYNC_BRAIN       — "true"/"false" to sync recent brain data (default: true)
-#   GITHUB_PERSONAL_ACCESS_TOKEN — For gh auth + GitHub MCP
-#   CLOUDFLARED_TOKEN — For Cloudflare Tunnel service install
+# Usage (select specific modules):
+#   curl -fsSL https://raw.githubusercontent.com/atnplex/setup/main/run.sh | bash -s -- --module tailscale --module docker
 #
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
+# ─── Colors ──────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+BOLD='\033[1m'
 NC='\033[0m'
 
-# Load defaults (single source of truth for all default values)
-load_defaults() {
-  if [[ -f "$SCRIPT_DIR/defaults.env" ]]; then
-    # shellcheck source=defaults.env
-    source "$SCRIPT_DIR/defaults.env"
-  elif [[ -f "${SETUP_REPO_DIR:-}/defaults.env" ]]; then
-    source "${SETUP_REPO_DIR}/defaults.env"
+log()  { echo -e "${BLUE}[SETUP]${NC} $*"; }
+ok()   { echo -e "${GREEN}[✓]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+err()  { echo -e "${RED}[✗]${NC} $*"; }
+die()  { err "$@"; exit 1; }
+
+# ─── Defaults (inline — no file dependency for curl|bash) ───────────────
+NAMESPACE="${NAMESPACE:-/atn}"
+GH_ORG="${GH_ORG:-atnplex}"
+DOCKER_NETWORK="${DOCKER_NETWORK:-atn_bridge}"
+SETUP_REPO_DIR="${SETUP_REPO_DIR:-${NAMESPACE}/github/setup}"
+LOG_DIR="${LOG_DIR:-${NAMESPACE}/logs}"
+BWS_SECRET_NAME_GH_PAT="${BWS_SECRET_NAME_GH_PAT:-GITHUB_PERSONAL_ACCESS_TOKEN}"
+
+export NAMESPACE GH_ORG DOCKER_NETWORK SETUP_REPO_DIR LOG_DIR
+
+# ─── Detect OS ───────────────────────────────────────────────────────────
+detect_os() {
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck source=/dev/null
+    source /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_VERSION="${VERSION_ID:-unknown}"
   else
-    # Minimal fallback when running via curl|bash before repo is cloned
-    NAMESPACE="${NAMESPACE:-/atn}"
-    GH_ORG="${GH_ORG:-atnplex}"
-    DOCKER_NETWORK="${DOCKER_NETWORK:-atn_bridge}"
+    die "Cannot detect OS — /etc/os-release not found"
   fi
-  LOG_DIR="${LOG_DIR:-${NAMESPACE}/logs}"
-  SETUP_REPO_DIR="${SETUP_REPO_DIR:-${NAMESPACE}/github/setup}"
+  log "Detected OS: $OS_ID $OS_VERSION"
 }
 
-banner() {
-  echo ""
-  echo -e "${BLUE}╔═══════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BLUE}║            Server Bootstrap (Modular)                ║${NC}"
-  echo -e "${BLUE}╚═══════════════════════════════════════════════════════╝${NC}"
-  echo ""
+# ─── Install base packages ──────────────────────────────────────────────
+install_base() {
+  log "Installing base packages..."
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq \
+    curl git jq rsync unzip python3 \
+    ca-certificates gnupg lsb-release \
+    2>/dev/null
+  ok "Base packages installed"
 }
 
-# Ensure base tools exist
-ensure_base() {
-  local missing=()
-  for cmd in curl git python3 rsync; do
-    command -v "$cmd" &>/dev/null || missing+=("$cmd")
-  done
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    echo -e "${BLUE}[SETUP]${NC} Installing base dependencies: ${missing[*]}"
-    sudo apt-get update -qq 2>/dev/null
-    sudo apt-get install -y -qq curl git python3 rsync jq unzip ca-certificates gnupg lsb-release 2>/dev/null
+# ─── Install BWS CLI if needed ──────────────────────────────────────────
+install_bws() {
+  if command -v bws &>/dev/null; then
+    ok "BWS CLI already installed ($(bws --version 2>/dev/null || echo 'unknown'))"
+    return 0
   fi
-}
 
-# Clone or update the setup repo
-ensure_repo() {
-  mkdir -p "$(dirname "$SETUP_REPO_DIR")"
-  if [[ -d "$SETUP_REPO_DIR/.git" ]]; then
-    echo -e "${GREEN}[✓]${NC} Setup repo exists at $SETUP_REPO_DIR"
-    cd "$SETUP_REPO_DIR" && git pull --quiet 2>/dev/null || true
+  log "Installing Bitwarden Secrets CLI..."
+  local bws_version="1.1.0"
+  local arch
+  arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+  case "$arch" in
+    amd64) arch="x86_64" ;;
+    arm64) arch="aarch64" ;;
+  esac
+
+  local url="https://github.com/bitwarden/sdk-internal/releases/download/bws-v${bws_version}/bws-${arch}-unknown-linux-gnu-${bws_version}.zip"
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  if curl -fsSL "$url" -o "$tmp_dir/bws.zip"; then
+    unzip -q "$tmp_dir/bws.zip" -d "$tmp_dir"
+    sudo install -m 755 "$tmp_dir/bws" /usr/local/bin/bws
+    rm -rf "$tmp_dir"
+    ok "BWS CLI installed"
   else
-    echo -e "${BLUE}[SETUP]${NC} Cloning setup repo..."
-    if command -v gh &>/dev/null && gh auth status &>/dev/null; then
-      gh repo clone "${GH_ORG}/setup" "$SETUP_REPO_DIR" -- --quiet
-    else
-      git clone "https://github.com/${GH_ORG}/setup.git" "$SETUP_REPO_DIR" 2>/dev/null || {
-        echo -e "${RED}[✗]${NC} Failed to clone repo. Ensure gh auth or SSH key is configured."
-        exit 1
-      }
+    rm -rf "$tmp_dir"
+    warn "Failed to install BWS CLI — you may need to install it manually"
+    return 1
+  fi
+}
+
+# ─── Check GitHub SSH access ────────────────────────────────────────────
+check_github_ssh() {
+  log "Checking GitHub SSH access..."
+  if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -T git@github.com 2>&1 | grep -qi "successfully authenticated"; then
+    ok "GitHub SSH access working"
+    return 0
+  fi
+  return 1
+}
+
+# ─── Check GitHub HTTPS access (via gh CLI or token) ────────────────────
+check_github_https() {
+  if [[ -n "${GH_TOKEN:-}" ]]; then
+    ok "GH_TOKEN already set"
+    export GITHUB_TOKEN="$GH_TOKEN"
+    return 0
+  fi
+  if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+    ok "GitHub CLI already authenticated"
+    GH_TOKEN="$(gh auth token 2>/dev/null || echo '')"
+    export GH_TOKEN GITHUB_TOKEN="${GH_TOKEN}"
+    return 0
+  fi
+  return 1
+}
+
+# ─── Resolve GitHub access (SSH → HTTPS → BWS → prompt) ────────────────
+resolve_github_access() {
+  # 1. Try SSH
+  if check_github_ssh; then
+    CLONE_METHOD="ssh"
+    return 0
+  fi
+
+  # 2. Try existing HTTPS token
+  if check_github_https; then
+    CLONE_METHOD="https"
+    return 0
+  fi
+
+  # 3. Try BWS to fetch GitHub PAT
+  log "No GitHub access found. Attempting to fetch credentials via BWS..."
+
+  # Ensure BWS is installed
+  install_bws || true
+
+  if ! command -v bws &>/dev/null; then
+    die "BWS CLI not available and no GitHub access configured. Cannot proceed."
+  fi
+
+  # Prompt for BWS access token if not set
+  if [[ -z "${BWS_ACCESS_TOKEN:-}" ]]; then
+    echo ""
+    echo -e "${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║  GitHub access required — enter BWS access token below  ║${NC}"
+    echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  The BWS (Bitwarden Secrets) token will be used to fetch"
+    echo -e "  your GitHub PAT. It is ${BOLD}not saved to disk${NC} — only held in"
+    echo -e "  memory for the duration of this script."
+    echo ""
+    read -rsp "  BWS Access Token: " BWS_ACCESS_TOKEN
+    echo ""
+    echo ""
+
+    if [[ -z "$BWS_ACCESS_TOKEN" ]]; then
+      die "No BWS token provided. Cannot fetch GitHub credentials."
     fi
   fi
-  # Re-source defaults from cloned repo (now has full defaults.env)
+
+  export BWS_ACCESS_TOKEN
+
+  # Fetch GitHub PAT from BWS
+  log "Fetching GitHub PAT from BWS (secret: $BWS_SECRET_NAME_GH_PAT)..."
+  local pat
+  pat="$(bws secret list -t "$BWS_ACCESS_TOKEN" -o json 2>/dev/null \
+    | jq -r --arg name "$BWS_SECRET_NAME_GH_PAT" '.[] | select(.key == $name) | .value' 2>/dev/null || echo '')"
+
+  if [[ -z "$pat" ]]; then
+    die "Could not retrieve '$BWS_SECRET_NAME_GH_PAT' from BWS. Check your token and secret name."
+  fi
+
+  GH_TOKEN="$pat"
+  export GH_TOKEN GITHUB_TOKEN="$GH_TOKEN"
+  ok "GitHub PAT retrieved from BWS"
+  CLONE_METHOD="https"
+}
+
+# ─── Clone the setup repo ───────────────────────────────────────────────
+clone_repo() {
+  local repo_url
+
+  if [[ "${CLONE_METHOD:-https}" == "ssh" ]]; then
+    repo_url="git@github.com:${GH_ORG}/setup.git"
+  else
+    repo_url="https://${GH_TOKEN}@github.com/${GH_ORG}/setup.git"
+  fi
+
+  if [[ -d "$SETUP_REPO_DIR/.git" ]]; then
+    ok "Setup repo already at $SETUP_REPO_DIR"
+    cd "$SETUP_REPO_DIR" && git pull --quiet 2>/dev/null || true
+  else
+    log "Cloning setup repo..."
+    mkdir -p "$(dirname "$SETUP_REPO_DIR")"
+    git clone --quiet "$repo_url" "$SETUP_REPO_DIR"
+    ok "Cloned to $SETUP_REPO_DIR"
+  fi
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────
+main() {
+  echo ""
+  echo -e "${BLUE}╔═══════════════════════════════════════════════════════╗${NC}"
+  echo -e "${BLUE}║            Server Bootstrap                          ║${NC}"
+  echo -e "${BLUE}╚═══════════════════════════════════════════════════════╝${NC}"
+  echo ""
+
+  detect_os
+  [[ "$OS_ID" == "debian" || "$OS_ID" == "ubuntu" ]] || die "Only Debian/Ubuntu supported (got: $OS_ID)"
+
+  install_base
+
+  # Create namespace
+  sudo mkdir -p "$NAMESPACE" "$LOG_DIR"
+  sudo chown -R "$(whoami):$(whoami)" "$NAMESPACE"
+
+  # Resolve GitHub access (SSH → existing token → BWS prompt)
+  resolve_github_access
+
+  clone_repo
+
+  # Re-source full defaults from cloned repo
   if [[ -f "$SETUP_REPO_DIR/defaults.env" ]]; then
     source "$SETUP_REPO_DIR/defaults.env"
   fi
-}
-
-main() {
-  load_defaults
-  banner
-
-  # Create namespace root
-  sudo mkdir -p "$NAMESPACE" "$LOG_DIR"
-  sudo chown -R "$USER:$USER" "$NAMESPACE" 2>/dev/null || true
-
-  ensure_base
-  ensure_repo
 
   cd "$SETUP_REPO_DIR"
-  export SETUP_REPO_DIR NAMESPACE GH_ORG DOCKER_NETWORK LOG_DIR
 
-  # Source the modular system
-  # shellcheck source=lib/core.sh
+  # Source modular system
   source lib/core.sh
-  # shellcheck source=lib/registry.sh
   source lib/registry.sh
 
   detect_os
   parse_args "$@"
   load_config_if_any
 
-  # Initialize module registry
+  # Initialize and run all modules
   registry_init modules
 
-  # Resolve which modules to run
   local run_dir="$LOG_DIR/run-$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$run_dir"
 
+  local modules_to_run
   mapfile -t modules_to_run < <(resolve_modules_from_flags_or_config)
   emit_run_manifest "$run_dir/manifest.json" "${modules_to_run[@]}"
 
-  log_info "Running ${#modules_to_run[@]} modules: ${modules_to_run[*]}"
+  log "Running ${#modules_to_run[@]} modules: ${modules_to_run[*]}"
 
   for mod in "${modules_to_run[@]}"; do
     run_module "$mod" "$run_dir"
   done
 
+  # ─── Summary ─────────────────────────────────────────────────────────
   echo ""
   echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
   echo -e "${GREEN}  Bootstrap Complete!${NC}"
   echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
   echo ""
-  echo "  Namespace: $NAMESPACE"
-  echo "  Run log:   $run_dir/"
+  echo "  Namespace:  $NAMESPACE"
+  echo "  Run log:    $run_dir/"
+  echo "  OS:         $OS_ID $OS_VERSION"
   echo ""
-  echo "  Next steps:"
-  echo "    1. Reload shell:  source ~/.bashrc"
-  echo "    2. If needed:     gh auth login"
-  echo "    3. If needed:     sudo tailscale up"
-  echo ""
-  if command -v tailscale &>/dev/null && tailscale status &>/dev/null; then
-    echo "  ✓ Tailscale: $(tailscale ip -4 2>/dev/null || echo 'connected')"
+  if command -v tailscale &>/dev/null; then
+    if tailscale status &>/dev/null; then
+      echo "  ✓ Tailscale: $(tailscale ip -4 2>/dev/null || echo 'connected')"
+    else
+      echo "  ! Tailscale: installed but not authenticated"
+      echo "    → Run: sudo tailscale up"
+    fi
+  fi
+  if command -v docker &>/dev/null; then
+    echo "  ✓ Docker: $(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')"
+  fi
+  if command -v gh &>/dev/null; then
+    echo "  ✓ GitHub CLI: $(gh --version 2>/dev/null | head -1 | awk '{print $3}')"
   fi
   echo ""
+  echo "  Next steps:"
+  echo "    1. source ~/.bashrc"
+  echo "    2. sudo tailscale up  (if not yet authenticated)"
+  echo "    3. Open VS Code → Remote SSH → $(hostname)"
+  echo ""
+
+  # Clear sensitive variables from memory
+  unset BWS_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN 2>/dev/null || true
 }
 
 main "$@"
