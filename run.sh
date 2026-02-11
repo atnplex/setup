@@ -227,26 +227,102 @@ resolve_github_access() {
   log "Fetching GitHub PAT from BWS (secret: $BWS_SECRET_NAME_GH_PAT)..."
   local pat="" bws_json=""
 
-  # Try with env var auth first (BWS_ACCESS_TOKEN already exported)
+  # Collect all secrets — try listing from all projects if supported
   bws_json="$(bws secret list -o json 2>"$SETUP_TMPDIR/.bws_err" || true)"
 
-  if [[ -z "$bws_json" ]]; then
+  # Also try project-scoped listing if the above returned empty or few results
+  local project_secrets=""
+  project_secrets="$(bws project list -o json 2>/dev/null || echo '[]')"
+  if [[ -n "$project_secrets" && "$project_secrets" != "[]" ]]; then
+    local project_ids
+    project_ids="$(echo "$project_secrets" | jq -r '.[].id' 2>/dev/null || true)"
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      local proj_secrets
+      proj_secrets="$(bws secret list --project-id "$pid" -o json 2>/dev/null || true)"
+      if [[ -n "$proj_secrets" && "$proj_secrets" != "[]" ]]; then
+        # Merge into main JSON array
+        if [[ -z "$bws_json" || "$bws_json" == "[]" ]]; then
+          bws_json="$proj_secrets"
+        else
+          bws_json="$(echo "$bws_json $proj_secrets" | jq -s 'add | unique_by(.id)' 2>/dev/null || echo "$bws_json")"
+        fi
+      fi
+    done <<<"$project_ids"
+  fi
+
+  if [[ -z "$bws_json" || "$bws_json" == "[]" ]]; then
     err "BWS secret list returned no data."
     [[ -s "$SETUP_TMPDIR/.bws_err" ]] && err "BWS error: $(cat "$SETUP_TMPDIR/.bws_err")"
     die "Check your BWS access token."
   fi
 
+  # Strategy 1: Exact match on configured name
   pat="$(echo "$bws_json" | jq -r --arg name "$BWS_SECRET_NAME_GH_PAT" \
-    '.[] | select(.key == $name) | .value' 2>/dev/null || echo '')"
+    '.[] | select(.key == $name) | .value' 2>/dev/null | head -1)"
+
+  # Strategy 2: Case-insensitive exact match
+  if [[ -z "$pat" ]]; then
+    pat="$(echo "$bws_json" | jq -r --arg name "$BWS_SECRET_NAME_GH_PAT" \
+      '.[] | select(.key | ascii_downcase == ($name | ascii_downcase)) | .value' 2>/dev/null | head -1)"
+  fi
+
+  # Strategy 3: Fuzzy keyword match — find secrets with github/pat/token in the name
+  if [[ -z "$pat" ]]; then
+    log "Exact match not found. Searching for GitHub PAT by keyword..."
+    local candidates
+    candidates="$(echo "$bws_json" | jq -r '
+      [.[] | select(
+        (.key | ascii_downcase) as $k |
+        ($k | contains("github")) or
+        ($k | contains("gh_pat")) or
+        ($k | contains("personal_access")) or
+        (($k | contains("pat")) and (($k | contains("git")) or ($k | contains("hub"))))
+      )] | sort_by(
+        # Score: prefer keys with more matching terms (lower = better)
+        (.key | ascii_downcase) as $k |
+        (if ($k | contains("github")) and ($k | contains("pat") or contains("personal_access_token")) then 0
+         elif ($k | contains("github")) and ($k | contains("token")) then 1
+         elif $k == "github_pat" or $k == "github" then 2
+         else 3 end)
+      ) | .[] | "\(.key)\t\(.value)"
+    ' 2>/dev/null || true)"
+
+    # Check each candidate — verify value looks like a GitHub PAT
+    while IFS=$'\t' read -r secret_key secret_val; do
+      [[ -z "$secret_key" ]] && continue
+      if [[ "$secret_val" =~ ^(ghp_|github_pat_|gho_) ]] || [[ ${#secret_val} -ge 30 ]]; then
+        log "Found likely GitHub PAT in secret '$secret_key'"
+        pat="$secret_val"
+        break
+      fi
+    done <<<"$candidates"
+  fi
+
+  # Strategy 4: Last resort — check ALL secrets for values that look like GitHub PATs
+  if [[ -z "$pat" ]]; then
+    log "No keyword matches. Scanning all secrets for GitHub PAT format..."
+    local all_vals
+    all_vals="$(echo "$bws_json" | jq -r '.[] | "\(.key)\t\(.value)"' 2>/dev/null || true)"
+    while IFS=$'\t' read -r secret_key secret_val; do
+      [[ -z "$secret_key" ]] && continue
+      if [[ "$secret_val" =~ ^(ghp_|github_pat_|gho_) ]]; then
+        log "Found GitHub PAT format in secret '$secret_key'"
+        pat="$secret_val"
+        break
+      fi
+    done <<<"$all_vals"
+  fi
 
   if [[ -z "$pat" ]]; then
-    err "Secret '$BWS_SECRET_NAME_GH_PAT' not found in BWS."
-    warn "Available secrets in your vault:"
+    err "Could not find a GitHub PAT in any BWS secret."
+    warn "Available secrets ($(echo "$bws_json" | jq 'length' 2>/dev/null || echo '?') total):"
     echo "$bws_json" | jq -r '.[].key' 2>/dev/null | while read -r k; do
       warn "  • $k"
     done
     echo ""
-    err "Set the correct name: export BWS_SECRET_NAME_GH_PAT=YourSecretName"
+    err "Either set the exact name: export BWS_SECRET_NAME_GH_PAT=YourSecretName"
+    err "Or pre-set the token: export GH_TOKEN=ghp_yourtoken"
     die "Then re-run the script."
   fi
 
