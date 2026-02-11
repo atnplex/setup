@@ -1,0 +1,103 @@
+# Persona Registry
+
+# Quick-reference for persona selection during triage.
+# Each persona has: trigger keywords, strengths, model tier.
+
+personas:
+  orchestrator:
+    path: /atn/.gemini/antigravity/personas/persona-orchestrator.md
+    keywords: [coordinate, plan, multi-task, complex, decompose, parallel]
+    strengths: [task decomposition, coordination, planning]
+    model_tier: opus
+    use_for: Complex multi-step tasks requiring coordination
+
+  architect:
+    path: /atn/.gemini/antigravity/personas/persona-architect.md
+    keywords: [design, architecture, system, scalable, structure, pattern]
+    strengths: [system design, patterns, scalability]
+    model_tier: opus
+    use_for: Architecture decisions, system design
+
+  frontend-dev:
+    path: /atn/.gemini/antigravity/personas/persona-frontend-dev.md
+    keywords: [react, ui, component, css, tailwind, frontend, web]
+    strengths: [React, UI/UX, components]
+    model_tier: sonnet
+    use_for: UI development, React components
+
+  backend-dev:
+    path: /atn/.gemini/antigravity/personas/persona-backend-dev.md
+    keywords: [api, server, database, rest, graphql, backend, node]
+    strengths: [APIs, server logic, databases]
+    model_tier: sonnet
+    use_for: Server-side development, API design
+
+  devops-engineer:
+    path: /atn/.gemini/antigravity/personas/persona-devops-engineer.md
+    keywords: [deploy, docker, ci, cd, pipeline, kubernetes, container]
+    strengths: [deployment, CI/CD, containers]
+    model_tier: sonnet
+    use_for: Deployments, infrastructure, pipelines
+
+  database-engineer:
+    path: /atn/.gemini/antigravity/personas/persona-database-engineer.md
+    keywords: [sql, database, postgres, mysql, migration, schema, query]
+    strengths: [database design, queries, optimization]
+    model_tier: sonnet
+    use_for: Database design, complex queries
+
+  security-auditor:
+    path: /atn/.gemini/antigravity/personas/persona-security-auditor.md
+    keywords: [security, auth, token, permission, vulnerability, secret]
+    strengths: [security review, vulnerability detection]
+    model_tier: opus
+    use_for: Security reviews, auth implementation
+
+  test-engineer:
+    path: /atn/.gemini/antigravity/personas/persona-test-engineer.md
+    keywords: [test, testing, jest, pytest, coverage, qa, verify]
+    strengths: [test design, coverage, edge cases]
+    model_tier: sonnet
+    use_for: Test implementation, verification
+
+  code-reviewer:
+    path: /atn/.gemini/antigravity/personas/persona-code-reviewer.md
+    keywords: [review, pr, pull request, feedback, quality, refactor]
+    strengths: [code quality, patterns, improvements]
+    model_tier: opus
+    use_for: PR reviews, code quality checks
+
+  docs-writer:
+    path: /atn/.gemini/antigravity/personas/persona-docs-writer.md
+    keywords: [docs, documentation, readme, guide, tutorial, explain]
+    strengths: [clear writing, examples, structure]
+    model_tier: flash
+    use_for: Documentation, READMEs, guides
+
+  ux-designer:
+    path: /atn/.gemini/antigravity/personas/persona-ux-designer.md
+    keywords: [ux, user experience, design, flow, usability, wireframe]
+    strengths: [user flows, usability, design]
+    model_tier: sonnet
+    use_for: UX design, user flow optimization
+
+  performance-engineer:
+    path: /atn/.gemini/antigravity/personas/persona-performance-engineer.md
+    keywords: [performance, optimize, speed, memory, latency, profiling]
+    strengths: [optimization, profiling, bottlenecks]
+    model_tier: sonnet
+    use_for: Performance optimization, profiling
+
+# Triage persona selection rules
+selection_rules:
+  min_keyword_match: 2 # Require 2+ keyword matches
+  max_personas: 5 # Limit parallel evaluations
+  timeout_seconds: 2 # Per-persona timeout
+
+  # Priority order for ties
+  priority:
+    - security-auditor # Security always high priority
+    - orchestrator # Complex tasks
+    - architect # Design tasks
+    - devops-engineer # Deploy tasks
+    - code-reviewer # Review tasks

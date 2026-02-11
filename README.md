@@ -1,82 +1,83 @@
-# ATN Bootstrap
+# ATN Server Setup
 
-Universal bootstrap script for ATN infrastructure - sets up Docker, MCP servers, gh CLI, Tailscale, Cloudflared on any server.
+Universal bootstrap for ATN infrastructure servers. One repo to set up any Debian server with everything needed: Docker, Tailscale, Cloudflared, GitHub CLI, MCP servers, and the full Antigravity agent configuration.
 
-## One-Liner Install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/atnplex/atn-bootstrap/main/bootstrap.sh | bash
-```
-
-## What It Does
-
-- ✅ Detects OS and architecture (Linux/macOS, x86_64/arm64)
-- ✅ Installs base dependencies (curl, wget, git, jq)
-- ✅ Installs Docker with compose plugin
-- ✅ Installs and authenticates GitHub CLI (`gh`)
-- ✅ Pulls MCP Docker images
-- ✅ Creates MCP docker-compose with systemd service
-- ✅ Installs Tailscale for mesh networking
-- ✅ Installs Cloudflared for tunnel access
-- ✅ Creates convenient shell aliases
-
-## Options
+## Quick Start
 
 ```bash
-./bootstrap.sh [OPTIONS]
+# Clone and run all modules
+git clone https://github.com/atnplex/setup.git /atn/github/setup
+cd /atn/github/setup
 
-Options:
-  --dry-run          Show what would be done without making changes
-  --skip-docker      Skip Docker installation
-  --skip-mcp         Skip MCP server setup
-  --non-interactive  Run without prompts (use defaults or env vars)
-  -h, --help         Show help message
+# Option 1: Run the all-in-one bootstrap (installs everything)
+./bootstrap.sh
+
+# Option 2: Run the modular system (ordered modules)
+source lib/core.sh
+source lib/registry.sh
+detect_os
+parse_args "$@"
+registry_init modules
+# Then run individual or all modules
 ```
 
-## After Bootstrap
+## Modules (execution order)
 
-Reload your shell and use these commands:
+| Order | Module | Description |
+|-------|--------|-------------|
+| 10 | `ssh` | Configure SSH server and client |
+| 20 | `users-groups` | Create users and set permissions |
+| 30 | `tailscale` | Install Tailscale mesh VPN |
+| 40 | `cloudflared` | Install Cloudflare Tunnel |
+| 50 | `docker` | Install Docker Engine + Compose |
+| 60 | `github-cli` | Install `gh` CLI + authenticate |
+| 70 | `agent-config` | **Deploy AG rules, skills, workflows, settings** |
+| 80 | `mcp-servers` | Pull MCP Docker images |
 
-```bash
-source ~/.bashrc
+## Config Directory
 
-# MCP Management
-mcp-start      # Start MCP server stack
-mcp-stop       # Stop MCP servers
-mcp-logs       # View MCP logs
-mcp-status     # Show running MCP containers
+The `config/` directory contains the portable, version-controlled agent configuration:
 
-# Antigravity Manager
-ag-logs        # View Antigravity Manager logs
-ag-restart     # Restart Antigravity Manager
-
-# Quick access
-ts-status      # Tailscale status
-cf-status      # Cloudflared status
-
-# GitHub shortcuts
-pr-list        # List PRs
-pr-view        # View current PR
-pr-merge       # Merge PR
 ```
+config/
+├── agent/
+│   ├── rules/          # 60+ operational, format, and security rules
+│   └── learning/       # Learning patterns and reflections
+├── gemini/
+│   ├── GEMINI.md       # Global rules entry point
+│   ├── mcp_config.json # MCP server configuration
+│   ├── skills/         # 22 skills with SKILL.md + scripts
+│   ├── global_workflows/  # 19 workflows (/triage, /resume, etc.)
+│   └── personas/       # 13 persona definitions
+├── baseline/           # Baseline rules (format, execution, governance)
+└── vscode/
+    └── machine-settings.json  # Auto-approve and editor settings
+```
+
+### What's NOT in this repo (sync separately)
+
+| Data | Size | Sync method |
+|------|------|-------------|
+| Brain/conversations | ~180MB | Syncthing or cloud drive |
+| Scratch state (session_log, todo) | ~30MB | Syncthing |
+| VS Code server binaries | ~2.5GB | Auto-downloaded on first connect |
+| Appdata (service volumes) | varies | Per-service backup |
+
+## Servers
+
+| Server | Tailscale IP | Role |
+|--------|-------------|------|
+| VPS1 (vps) | 100.67.88.109 | HA secondary |
+| VPS2 (condo) | 100.102.55.88 | HA primary |
+| Unraid | 100.76.168.116 | Media services |
+| Debian VM | 100.74.111.60 | Development/testing |
 
 ## Environment Variables
 
-The script looks for tokens in:
-1. `GITHUB_PERSONAL_ACCESS_TOKEN` environment variable
-2. `~/.antigravity-server/.env` file
+Set these before running for non-interactive setup:
 
-Set these before running for automatic authentication.
-
-## Supported Systems
-
-| OS | Architecture | Package Manager |
-|----|--------------|----------------|
-| Debian/Ubuntu | x86_64, arm64 | apt |
-| RHEL/CentOS | x86_64, arm64 | yum |
-| macOS | x86_64, arm64 | brew |
-| Unraid | x86_64 | (custom detection) |
-
-## License
-
-MIT
+```bash
+export GITHUB_PERSONAL_ACCESS_TOKEN="ghp_..."
+export CLOUDFLARED_TOKEN="eyJ..."       # Cloudflare tunnel token
+export NAMESPACE="/atn"             # Default: /atn
+```

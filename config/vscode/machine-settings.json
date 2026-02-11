@@ -1,0 +1,34 @@
+{
+  "chat.editing.autoAcceptDelay": 500,
+  "chat.tools.eligibleForAutoApproval": {
+    "*": true
+  },
+  "chat.useClaudeSkills": true,
+  "chat.useNestedAgentsMdFiles": true,
+  "chat.tools.global.autoApprove": true,
+  "chat.tools.urls.autoApprove": {
+    "*": true
+  },
+  "chat.customAgentInSubagent.enabled": true,
+  "chat.customAgentInSubagent.autoApprove": true,
+  "chat.mcp.discovery.enabled": {
+    "claude-desktop": false,
+    "antigravity": true,
+    "cursor-global": false,
+    "cursor-workspace": false
+  },
+  "chat.mcp.gallery.enabled": true,
+  "antigravity.marketplaceExtensionGalleryServiceURL": "https://marketplace.visualstudio.com/_apis/public/gallery",
+  "antigravity.marketplaceGalleryItemURL": "https://marketplace.visualstudio.com/item",
+  "antigravity.autoApproveCommands": true,
+  "antigravity.terminal.autoApprove": true,
+  "antigravity.security.autoApproveCommands": true,
+  "search.exclude": {
+    "**/.agent": false,
+    "**/rules": false
+  },
+  "files.exclude": {
+    "**/.agent": false,
+    "**/rules": false
+  }
+}

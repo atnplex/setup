@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.1.0",
+  "repo_name": "[REPO_NAME]",
+  "full_name": "atnplex/[REPO_NAME]",
+  "github_url": "https://github.com/atnplex/[REPO_NAME]",
+  "processed_date_utc": "[ISO_DATE_UTC]",
+  "last_updated": "[ISO_DATE]",
+  "primary_language": "[LANGUAGE]",
+  "description": "[DESCRIPTION]",
+  "execution_target": "wsl",
+  "watcher_mode": "wsl_remote",
+  "paths": {
+    "linux_root": "/atn/github/[REPO_NAME]",
+    "windows_root": "C:\\atn\\github\\[REPO_NAME]",
+    "wsl_windows_mount_root": "/mnt/c/atn/github/[REPO_NAME]"
+  },
+  "preflight": {
+    "preflight_timestamp_utc": "[ISO_DATE_UTC]",
+    "preflight_result": "pass",
+    "preflight_version": "1.1.0",
+    "preflight_artifact_path": "[NN]-[REPO_NAME]/preflight.json"
+  },
+  "files_analyzed": [],
+  "standards_found": {
+    "folder_structure": false,
+    "naming_conventions": false,
+    "policies": false,
+    "guidelines": false,
+    "path_references": false
+  },
+  "statistics": {
+    "total_files": 0,
+    "documentation_files": 0,
+    "configuration_files": 0,
+    "script_files": 0
+  },
+  "key_findings": [],
+  "conflicts": [],
+  "recommendations": []
+}

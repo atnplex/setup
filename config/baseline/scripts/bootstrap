@@ -1,0 +1,229 @@
+<# : Polyglot Bootstrap Script - Works in both PowerShell and Bash
+# PowerShell sees this as a comment block
+# Bash sees this as a command with a colon (no-op) followed by a here-doc
+
+# === BASH SECTION ===
+if [ -n "$BASH_VERSION" ]; then
+    set -e
+    echo "=== Unified Bootstrap (Bash) ==="
+    
+    # Check if PowerShell is available
+    if command -v pwsh &> /dev/null || command -v powershell &> /dev/null; then
+        echo "PowerShell detected. Switching to PowerShell mode..."
+        if command -v pwsh &> /dev/null; then
+            pwsh "$0"
+        else
+            powershell "$0"
+        fi
+        exit 0
+    fi
+    
+    echo "Environment: Linux/WSL (Bash mode)"
+    
+    # Install core dependencies
+    echo ""
+    echo "[1/5] Installing core dependencies..."
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update
+        sudo apt-get install -y wget curl git unzip ca-certificates
+    elif command -v yum &> /dev/null; then
+        sudo yum install -y wget curl git unzip ca-certificates
+    else
+        echo "ERROR: Unsupported package manager"
+        exit 1
+    fi
+    echo "Core tools installed."
+    
+    # Install Bitwarden CLI
+    echo ""
+    echo "[2/5] Installing Bitwarden CLI (bw)..."
+    if ! command -v bw &> /dev/null; then
+        curl -L -o /tmp/bw.zip "https://vault.bitwarden.com/download/?app=cli&platform=linux"
+        sudo unzip -o /tmp/bw.zip -d /usr/local/bin
+        sudo chmod +x /usr/local/bin/bw
+        rm /tmp/bw.zip
+        echo "Bitwarden CLI installed: $(bw --version)"
+    else
+        echo "Bitwarden CLI already installed."
+    fi
+    
+    # Install Bitwarden Secrets Manager
+    echo ""
+    echo "[3/5] Installing Bitwarden Secrets Manager (bws)..."
+    if ! command -v bws &> /dev/null; then
+        VERSION=$(curl -s https://api.github.com/repos/bitwarden/sm/releases/latest | grep '"tag_name":' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
+        echo "Latest bws version: $VERSION"
+        cd /tmp
+        curl -L -f -o bws.zip "https://github.com/bitwarden/sm/releases/download/$VERSION/bws-x86_64-unknown-linux-gnu.zip"
+        unzip -o bws.zip
+        sudo chmod +x bws
+        sudo mv bws /usr/local/bin/bws
+        rm bws.zip
+        echo "Bitwarden SM installed: $(bws --version)"
+    else
+        echo "Bitwarden SM already installed."
+    fi
+    
+    # Configure baseline directory
+    echo ""
+    echo "[4/5] Configuring baseline directory..."
+    mkdir -p ~/.atn
+    if [ -d "/mnt/c/atn/baseline" ]; then
+        echo "WSL detected. Using /mnt/c/atn/baseline"
+        ln -sf /mnt/c/atn/baseline ~/.atn/baseline
+    else
+        echo "Remote server detected."
+        if [ ! -d ~/.atn/baseline ]; then
+            echo "WARNING: Baseline repo not cloned. Clone manually:"
+            echo "  git clone https://github.com/yourusername/baseline.git ~/.atn/baseline"
+        fi
+    fi
+    
+    # Link workflows
+    echo ""
+    echo "[5/5] Linking workflows..."
+    mkdir -p ~/.agent
+    if [ -d ~/.atn/baseline/workflows ]; then
+        ln -sf ~/.atn/baseline/workflows ~/.agent/workflows
+        echo "Workflows linked: ~/.agent/workflows -> ~/.atn/baseline/workflows"
+    else
+        echo "WARNING: No workflows found in baseline."
+    fi
+    
+    echo ""
+    echo "=== Bootstrap Complete ==="
+    echo "Verify with: ls -la ~/.agent/workflows"
+    exit 0
+fi
+
+# PowerShell continues here
+: << 'POWERSHELL_CODE'
+#>
+
+# === POWERSHELL SECTION ===
+$ErrorActionPreference = "Stop"
+
+# Detect environment
+$IsWindowsOS = $PSVersionTable.PSVersion.Major -ge 6 -and $IsWindows
+$IsWSL = Test-Path "/proc/version" -ErrorAction SilentlyContinue -and (Get-Content "/proc/version" -Raw -ErrorAction SilentlyContinue) -match "microsoft|WSL"
+$IsLinuxOS = $PSVersionTable.Platform -eq "Unix" -and -not $IsWSL
+
+Write-Host "=== Unified Bootstrap (PowerShell) ===" -ForegroundColor Cyan
+
+if ($IsWindowsOS) {
+    Write-Host "Environment: Windows" -ForegroundColor Green
+    
+    # Check Administrator
+    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    $isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    
+    if (-not $isAdmin) {
+        Write-Host "ERROR: Please run as Administrator" -ForegroundColor Red
+        exit 1
+    }
+    
+    # Check WSL
+    Write-Host "`n[1/5] Checking WSL..." -ForegroundColor Yellow
+    $wslInstalled = Get-Command wsl -ErrorAction SilentlyContinue
+    if (-not $wslInstalled) {
+        Write-Host "Installing WSL (Debian)..." -ForegroundColor Red
+        wsl --install -d Debian --no-launch
+        Write-Host "WSL installed. Please RESTART your computer and re-run this script." -ForegroundColor Green
+        exit 0
+    }
+    Write-Host "WSL is installed." -ForegroundColor Green
+    
+    # Configure WSL
+    Write-Host "`n[2/5] Configuring WSL..." -ForegroundColor Yellow
+    "[boot]`nsystemd=true" | wsl --user root --exec bash -c "cat > /etc/wsl.conf"
+    wsl --user root --exec bash -c "apt-get update && apt-get install -y wget curl git unzip ca-certificates"
+    Write-Host "WSL configured." -ForegroundColor Green
+    
+    # Install Tailscale
+    Write-Host "`n[3/5] Installing Tailscale in WSL..." -ForegroundColor Yellow
+    wsl --user root --exec bash -c "curl -fsSL https://tailscale.com/install.sh | sh"
+    Write-Host "Tailscale installed." -ForegroundColor Green
+    
+    # Configure SSH
+    Write-Host "`n[4/5] Configuring SSH..." -ForegroundColor Yellow
+    $sshDir = "$env:USERPROFILE\.ssh"
+    $keyPath = "$sshDir\id_ed25519_antigravity"
+    
+    if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Path $sshDir -Force | Out-Null }
+    if (-not (Test-Path $keyPath)) {
+        ssh-keygen -t ed25519 -f $keyPath -N '""' -C "antigravity-wsl"
+    }
+    
+    $tailscaleIP = wsl --exec bash -c "tailscale ip -4 2>/dev/null || echo '100.114.18.47'"
+    
+    @"
+Host antigravity-wsl
+    HostName $tailscaleIP
+    User alex
+    IdentityFile "$keyPath"
+    CheckHostIP no
+    UserKnownHostsFile /dev/null
+    StrictHostKeyChecking no
+    IdentitiesOnly yes
+    LogLevel ERROR
+"@ | Out-File -FilePath "$sshDir\config" -Encoding ascii -Force
+    
+    Write-Host "SSH configured." -ForegroundColor Green
+    
+    # Run Linux bootstrap in WSL
+    Write-Host "`n[5/5] Running Linux bootstrap in WSL..." -ForegroundColor Yellow
+    wsl --exec bash -c "curl -fsSL https://raw.githubusercontent.com/yourusername/baseline/main/bootstrap | bash"
+    
+    Write-Host "`n=== Bootstrap Complete ===" -ForegroundColor Cyan
+    Write-Host "Next: wsl --terminate Debian && wsl tailscale up --ssh" -ForegroundColor Yellow
+    
+} elseif ($IsWSL -or $IsLinuxOS) {
+    Write-Host "Environment: Linux/WSL" -ForegroundColor Green
+    
+    # Install tools
+    Write-Host "`n[1/5] Installing dependencies..." -ForegroundColor Yellow
+    if (Get-Command apt-get -ErrorAction SilentlyContinue) {
+        sudo apt-get update
+        sudo apt-get install -y wget curl git unzip ca-certificates
+    }
+    
+    # Install Bitwarden
+    Write-Host "`n[2/5] Installing Bitwarden CLI..." -ForegroundColor Yellow
+    if (-not (Get-Command bw -ErrorAction SilentlyContinue)) {
+        curl -L -o /tmp/bw.zip "https://vault.bitwarden.com/download/?app=cli&platform=linux"
+        sudo unzip -o /tmp/bw.zip -d /usr/local/bin
+        sudo chmod +x /usr/local/bin/bw
+        rm /tmp/bw.zip
+    }
+    
+    Write-Host "`n[3/5] Installing Bitwarden SM..." -ForegroundColor Yellow
+    if (-not (Get-Command bws -ErrorAction SilentlyContinue)) {
+        $version = bash -c "curl -s https://api.github.com/repos/bitwarden/sm/releases/latest | grep '\"tag_name\":' | head -n 1 | sed -E 's/.*\"([^\"]+)\".*/\1/'"
+        curl -L -f -o /tmp/bws.zip "https://github.com/bitwarden/sm/releases/download/$version/bws-x86_64-unknown-linux-gnu.zip"
+        cd /tmp
+        unzip -o bws.zip
+        sudo chmod +x bws
+        sudo mv bws /usr/local/bin/bws
+        rm bws.zip
+    }
+    
+    # Configure baseline
+    Write-Host "`n[4/5] Configuring baseline..." -ForegroundColor Yellow
+    New-Item -ItemType Directory -Path "$HOME/.atn" -Force | Out-Null
+    if (Test-Path "/mnt/c/atn/baseline") {
+        New-Item -ItemType SymbolicLink -Path "$HOME/.atn/baseline" -Target "/mnt/c/atn/baseline" -Force | Out-Null
+    }
+    
+    # Link workflows
+    Write-Host "`n[5/5] Linking workflows..." -ForegroundColor Yellow
+    New-Item -ItemType Directory -Path "$HOME/.agent" -Force | Out-Null
+    if (Test-Path "$HOME/.atn/baseline/workflows") {
+        New-Item -ItemType SymbolicLink -Path "$HOME/.agent/workflows" -Target "$HOME/.atn/baseline/workflows" -Force | Out-Null
+    }
+    
+    Write-Host "`n=== Bootstrap Complete ===" -ForegroundColor Cyan
+}
+
+<#
+POWERSHELL_CODE
+#>
