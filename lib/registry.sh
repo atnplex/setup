@@ -2,6 +2,56 @@
 
 declare -a MODULE_IDS=()
 declare -A MODULE_ORDER_MAP=()
+SUDO_AVAILABLE="" # cached: "yes", "no", or "" (unknown)
+
+# ─── Check if we can escalate to root ────────────────────────────────────
+_check_sudo() {
+  # Already root
+  if [[ $EUID -eq 0 ]]; then
+    SUDO_AVAILABLE="yes"
+    return 0
+  fi
+
+  # Already checked
+  if [[ -n "$SUDO_AVAILABLE" ]]; then
+    [[ "$SUDO_AVAILABLE" == "yes" ]]
+    return $?
+  fi
+
+  # Test if user can sudo
+  if command -v sudo &>/dev/null; then
+    # Try non-interactive first (passwordless sudo or cached credentials)
+    if sudo -n true 2>/dev/null; then
+      SUDO_AVAILABLE="yes"
+      return 0
+    fi
+
+    # Interactive: prompt user for password
+    log_info "Root access required for system modules. Requesting sudo..."
+    if sudo -v 2>/dev/null; then
+      SUDO_AVAILABLE="yes"
+      # Keep sudo credentials alive in background
+      (while true; do
+        sudo -n true
+        sleep 50
+      done) &>/dev/null &
+      SUDO_KEEP_ALIVE_PID=$!
+      return 0
+    fi
+  fi
+
+  SUDO_AVAILABLE="no"
+  return 1
+}
+
+# ─── Run a command with root if needed ───────────────────────────────────
+_run_as_root() {
+  if [[ $EUID -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
 
 registry_init() {
   local modules_dir="$1"
@@ -30,8 +80,10 @@ run_module() {
 
   if module_requires_root 2>/dev/null; then
     if [[ $EUID -ne 0 ]]; then
-      log_warn "Module $module_id requires root; skipping (not root)."
-      return
+      if ! _check_sudo; then
+        log_warn "Module $module_id requires root and sudo is not available; skipping."
+        return
+      fi
     fi
   fi
 
@@ -54,7 +106,8 @@ resolve_modules_from_flags_or_config() {
 }
 
 emit_run_manifest() {
-  local path="$1"; shift
+  local path="$1"
+  shift
   local modules=("$@")
   {
     echo '{'
@@ -71,5 +124,5 @@ emit_run_manifest() {
     echo
     echo '  ]'
     echo '}'
-  } > "$path"
+  } >"$path"
 }
