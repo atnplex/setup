@@ -97,14 +97,13 @@ fi
 # ── 1d. Namespace directory structure ─────────────────────────────────
 log "Checking namespace directory structure..."
 DIRS_NEEDED=0
-for d in "$NAMESPACE"/{.gemini/antigravity/{skills,global_workflows,scratch,personas,brain},.agent/{rules,learning/reflections},baseline,github,bin,logs}; do
-  if [[ ! -d "$d" ]]; then
-    mkdir -p "$d"
-    ((DIRS_NEEDED++))
-  fi
-done
-# Home dirs
-for d in "$HOME"/.gemini/antigravity/{brain,knowledge,scratch}; do
+# Namespace dirs (these are real directories)
+for d in \
+  "$NAMESPACE"/.gemini/antigravity/{skills,global_workflows,scratch,personas,brain,conversations,knowledge,scripts,annotations,browser_recordings,implicit,infrastructure,code_tracker,context_state,templates} \
+  "$NAMESPACE"/.gemini/{knowledge,rules,scratch,workflows} \
+  "$NAMESPACE"/.agent/{rules,learning/reflections,config,personas,scripts,skills,workflows} \
+  "$NAMESPACE"/.antigravity-server/data/Machine \
+  "$NAMESPACE"/{baseline,github,bin,logs,scripts,config,tmp,appdata,.config,.github,.venv}; do
   if [[ ! -d "$d" ]]; then
     mkdir -p "$d"
     ((DIRS_NEEDED++))
@@ -156,6 +155,65 @@ Host *
 SSHCONF
   chmod 600 "$HOME/.ssh/config"
   fixed "Created SSH config"
+fi
+
+# ── 1g. Symlinks (critical — matches vps2 structure) ─────────────────
+step "Phase 1g: Symlinks"
+
+# ~/.gemini → /atn/.gemini
+if [[ -L "$HOME/.gemini" ]]; then
+  CURRENT_TARGET="$(readlink "$HOME/.gemini")"
+  if [[ "$CURRENT_TARGET" == "$NAMESPACE/.gemini" ]]; then
+    skipped "~/.gemini → $NAMESPACE/.gemini"
+  else
+    rm "$HOME/.gemini"
+    ln -s "$NAMESPACE/.gemini" "$HOME/.gemini"
+    fixed "~/.gemini → $NAMESPACE/.gemini (was → $CURRENT_TARGET)"
+  fi
+elif [[ -d "$HOME/.gemini" ]]; then
+  warn "~/.gemini is a real directory, not a symlink"
+  warn "Moving to ~/.gemini.bak and creating symlink"
+  mv "$HOME/.gemini" "$HOME/.gemini.bak.$(date +%s)"
+  ln -s "$NAMESPACE/.gemini" "$HOME/.gemini"
+  fixed "~/.gemini → $NAMESPACE/.gemini (backed up old dir)"
+else
+  ln -s "$NAMESPACE/.gemini" "$HOME/.gemini"
+  fixed "~/.gemini → $NAMESPACE/.gemini"
+fi
+
+# ~/.agent → /atn/.agent
+if [[ -L "$HOME/.agent" ]]; then
+  CURRENT_TARGET="$(readlink "$HOME/.agent")"
+  if [[ "$CURRENT_TARGET" == "$NAMESPACE/.agent" ]]; then
+    skipped "~/.agent → $NAMESPACE/.agent"
+  else
+    rm "$HOME/.agent"
+    ln -s "$NAMESPACE/.agent" "$HOME/.agent"
+    fixed "~/.agent → $NAMESPACE/.agent (was → $CURRENT_TARGET)"
+  fi
+elif [[ -d "$HOME/.agent" ]]; then
+  mv "$HOME/.agent" "$HOME/.agent.bak.$(date +%s)"
+  ln -s "$NAMESPACE/.agent" "$HOME/.agent"
+  fixed "~/.agent → $NAMESPACE/.agent (backed up old dir)"
+else
+  ln -s "$NAMESPACE/.agent" "$HOME/.agent"
+  fixed "~/.agent → $NAMESPACE/.agent"
+fi
+
+# /atn/rules → .agent/rules (convenience shortcut)
+if [[ -L "$NAMESPACE/rules" ]]; then
+  skipped "/atn/rules → .agent/rules"
+else
+  ln -s ".agent/rules" "$NAMESPACE/rules" 2>/dev/null || true
+  fixed "/atn/rules → .agent/rules"
+fi
+
+# /atn/.gemini/mcp_config.json → antigravity/mcp_config.json
+if [[ -L "$NAMESPACE/.gemini/mcp_config.json" ]]; then
+  skipped "mcp_config.json symlink"
+else
+  ln -sf "antigravity/mcp_config.json" "$NAMESPACE/.gemini/mcp_config.json"
+  fixed "mcp_config.json → antigravity/mcp_config.json"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -411,6 +469,22 @@ if [[ "$SSH_OK" == "true" ]]; then
     ok "Knowledge synced: $(ls -1 "$HOME/.gemini/antigravity/knowledge/" 2>/dev/null | wc -l) items" ||
     warn "Knowledge sync failed"
 
+  # ── 5d. Antigravity server data (VS Code settings, extensions) ────
+  log "Syncing antigravity-server data..."
+  rsync -az --timeout=30 \
+    --include='data/***' --include='extensions/***' \
+    --exclude='*.log' --exclude='*.pid' --exclude='*.token' --exclude='*.lock' --exclude='logs/***' \
+    "$USER@${SOURCE}:${NAMESPACE}/.antigravity-server/" \
+    "$NAMESPACE/.antigravity-server/" 2>/dev/null &&
+    fixed "Antigravity server data synced" || warn "Antigravity server sync failed"
+
+  # ── 5e. Conversations + implicit data ─────────────────────────────
+  log "Syncing conversations..."
+  rsync -az --timeout=30 \
+    "$USER@${SOURCE}:${NAMESPACE}/.gemini/antigravity/conversations/" \
+    "$NAMESPACE/.gemini/antigravity/conversations/" 2>/dev/null &&
+    ok "Conversations synced" || warn "Conversations sync failed"
+
 else
   warn "Skipping data sync — no SSH connectivity to $SOURCE"
   warn "You can run this script again once Tailscale SSH is working"
@@ -479,6 +553,7 @@ echo "  Rules:          $(find "$NAMESPACE/.agent/rules" -type f 2>/dev/null | w
 echo "  Skills:         $(($(find "$NAMESPACE/.gemini/antigravity/skills" -maxdepth 1 -type d 2>/dev/null | wc -l) - 1))"
 echo "  Workflows:      $(find "$NAMESPACE/.gemini/antigravity/global_workflows" -type f 2>/dev/null | wc -l)"
 echo "  Docker:         $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo 'N/A')"
+echo "  Symlinks:       ~/.gemini→$(readlink ~/.gemini 2>/dev/null || echo 'MISSING')  ~/.agent→$(readlink ~/.agent 2>/dev/null || echo 'MISSING')"
 echo "  Syncthing:      $(systemctl --user is-active syncthing 2>/dev/null || echo 'N/A')"
 echo ""
 
