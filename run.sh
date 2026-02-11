@@ -83,14 +83,18 @@ install_base() {
   ok "Base packages installed"
 }
 
-# ─── Install BWS CLI if needed ──────────────────────────────────────────
+# ─── Install BWS CLI ─────────────────────────────────────────────────────
+# Usage: install_bws [version] [--force]
+#   version: explicit version (e.g. "1.0.0"), or empty for latest
+#   --force: reinstall even if already present
 install_bws() {
-  if command -v bws &>/dev/null; then
+  local target_version="${1:-}"
+  local force="${2:-}"
+
+  if [[ "$force" != "--force" ]] && command -v bws &>/dev/null; then
     ok "BWS CLI already installed ($(bws --version 2>/dev/null || echo 'unknown'))"
     return 0
   fi
-
-  log "Installing Bitwarden Secrets CLI..."
 
   # Detect architecture
   local arch
@@ -100,30 +104,31 @@ install_bws() {
   arm64) arch="aarch64" ;;
   esac
 
-  # Dynamically fetch latest BWS version from GitHub API
-  local bws_version=""
-  local api_response
-  api_response="$(curl -fsSL "https://api.github.com/repos/bitwarden/sdk/releases?per_page=10" 2>/dev/null || echo '')"
-  if [[ -n "$api_response" ]]; then
-    bws_version="$(echo "$api_response" | jq -r '[.[] | select(.tag_name | startswith("bws-v"))][0].tag_name // ""' 2>/dev/null | sed 's/^bws-v//')"
+  # Resolve version
+  if [[ -z "$target_version" ]]; then
+    log "Detecting latest BWS CLI version..."
+    local api_response
+    api_response="$(curl -fsSL "https://api.github.com/repos/bitwarden/sdk-sm/releases?per_page=10" 2>/dev/null || echo '')"
+    if [[ -n "$api_response" ]]; then
+      target_version="$(echo "$api_response" | jq -r '[.[] | select(.tag_name | startswith("bws-v"))][0].tag_name // ""' 2>/dev/null | sed 's/^bws-v//')"
+    fi
+    target_version="${target_version:-2.0.0}"
   fi
-  # Fallback to known-good version
-  bws_version="${bws_version:-2.0.0}"
-  log "BWS CLI version: $bws_version"
 
-  # Download from bitwarden/sdk-sm (where release binaries are hosted)
-  local url="https://github.com/bitwarden/sdk-sm/releases/download/bws-v${bws_version}/bws-${arch}-unknown-linux-gnu-${bws_version}.zip"
-  local dl_dir="$SETUP_TMPDIR/bws"
+  log "Installing BWS CLI v${target_version}..."
+
+  local url="https://github.com/bitwarden/sdk-sm/releases/download/bws-v${target_version}/bws-${arch}-unknown-linux-gnu-${target_version}.zip"
+  local dl_dir="$SETUP_TMPDIR/bws-${target_version}"
+  rm -rf "$dl_dir"
   mkdir -p "$dl_dir"
   log "Downloading from: $url"
   if curl -fsSL "$url" -o "$dl_dir/bws.zip"; then
-    unzip -q "$dl_dir/bws.zip" -d "$dl_dir"
-    # Find the bws binary (might be in a subdirectory)
+    unzip -oq "$dl_dir/bws.zip" -d "$dl_dir"
     local bws_bin
     bws_bin="$(find "$dl_dir" -name 'bws' -type f | head -1)"
     if [[ -n "$bws_bin" ]]; then
       sudo install -m 755 "$bws_bin" /usr/local/bin/bws
-      ok "BWS CLI $bws_version installed"
+      ok "BWS CLI v${target_version} installed"
     else
       err "BWS binary not found in downloaded archive"
       return 1
@@ -227,8 +232,25 @@ resolve_github_access() {
   log "Fetching GitHub PAT from BWS (secret: $BWS_SECRET_NAME_GH_PAT)..."
   local pat="" bws_json=""
 
-  # Collect all secrets — try listing from all projects if supported
+  # Fetch secrets — with automatic v1/v2 token compatibility fallback
   bws_json="$(bws secret list -o json 2>"$SETUP_TMPDIR/.bws_err" || true)"
+
+  # If we get the "decryption key" error, the token format doesn't match the CLI version
+  if [[ -z "$bws_json" ]] && grep -qi "decryption key" "$SETUP_TMPDIR/.bws_err" 2>/dev/null; then
+    local current_ver
+    current_ver="$(bws --version 2>/dev/null | awk '{print $NF}' || echo 'unknown')"
+    if [[ "$current_ver" == 2.* ]]; then
+      warn "BWS v2 can't decrypt your token — your token uses v1 format."
+      warn "Auto-installing BWS v1.0.0 for compatibility..."
+      install_bws "1.0.0" "--force" || true
+      bws_json="$(bws secret list -o json 2>"$SETUP_TMPDIR/.bws_err" || true)"
+    elif [[ "$current_ver" == 1.* || "$current_ver" == 0.* ]]; then
+      warn "BWS v1 can't decrypt your token — your token may use v2 format."
+      warn "Auto-installing BWS v2.0.0 for compatibility..."
+      install_bws "2.0.0" "--force" || true
+      bws_json="$(bws secret list -o json 2>"$SETUP_TMPDIR/.bws_err" || true)"
+    fi
+  fi
 
   # Also try project-scoped listing if the above returned empty or few results
   local project_secrets=""
