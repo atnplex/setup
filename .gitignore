@@ -1,0 +1,7 @@
+# ATN Setup - Generated files
+*.log
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
