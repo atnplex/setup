@@ -223,13 +223,31 @@ resolve_github_access() {
   export BWS_ACCESS_TOKEN
 
   # Fetch GitHub PAT from BWS
+  # BWS_ACCESS_TOKEN is already exported — bws picks it up automatically
   log "Fetching GitHub PAT from BWS (secret: $BWS_SECRET_NAME_GH_PAT)..."
-  local pat
-  pat="$(bws secret list -t "$BWS_ACCESS_TOKEN" -o json 2>/dev/null |
-    jq -r --arg name "$BWS_SECRET_NAME_GH_PAT" '.[] | select(.key == $name) | .value' 2>/dev/null || echo '')"
+  local pat="" bws_err=""
+
+  # Try with env var auth first (BWS_ACCESS_TOKEN already exported)
+  bws_err="$(bws secret list -o json 2>&1 1>"$SETUP_TMPDIR/.bws_out" || true)"
+  if [[ -f "$SETUP_TMPDIR/.bws_out" ]]; then
+    pat="$(jq -r --arg name "$BWS_SECRET_NAME_GH_PAT" '.[] | select(.key == $name) | .value' "$SETUP_TMPDIR/.bws_out" 2>/dev/null || echo '')"
+    rm -f "$SETUP_TMPDIR/.bws_out"
+  fi
+
+  # Fallback: try with explicit --access-token flag
+  if [[ -z "$pat" ]]; then
+    log "Retrying with explicit --access-token flag..."
+    pat="$(bws secret list --access-token "$BWS_ACCESS_TOKEN" -o json 2>/dev/null |
+      jq -r --arg name "$BWS_SECRET_NAME_GH_PAT" '.[] | select(.key == $name) | .value' 2>/dev/null || echo '')"
+  fi
 
   if [[ -z "$pat" ]]; then
-    die "Could not retrieve '$BWS_SECRET_NAME_GH_PAT' from BWS. Check your token and secret name."
+    err "Could not retrieve '$BWS_SECRET_NAME_GH_PAT' from BWS."
+    if [[ -n "$bws_err" ]]; then
+      err "BWS error: $bws_err"
+    fi
+    err "Debug: run 'BWS_ACCESS_TOKEN=xxx bws secret list -o json' to check available secrets."
+    die "Check your BWS token and verify the secret name exists."
   fi
 
   GH_TOKEN="$pat"
