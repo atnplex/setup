@@ -1,13 +1,68 @@
 #!/usr/bin/env bash
 # Module: sys/tmpfs
-# Version: 0.1.0
-# Provides: Tmpfs detection, workspace selection, TMP_DIR contract
+# Version: 0.2.0
+# Provides: Tmpfs detection, workspace selection, TMP_DIR contract,
+#           percentage/unit-aware size parsing
 # Requires: none
 [[ -n "${_STDLIB_TMPFS:-}" ]] && return 0
 declare -g _STDLIB_TMPFS=1
+declare -g _STDLIB_MOD_VERSION="0.2.0"
 
 # ── Internal State ─────────────────────────────────────────────────────
 declare -g TMP_DIR="" # Exported after create_workspace
+
+# ── stdlib::tmpfs::_parse_size ────────────────────────────────────────
+# Parse a size specification into megabytes.
+#
+# Supported formats:
+#   "50%"   → 50% of total RAM (from /proc/meminfo MemTotal)
+#   "100M"  → 100 megabytes
+#   "2G"    → 2048 megabytes
+#   "auto"  → returns empty string (caller omits size= from mount opts)
+#   "1024"  → 1024 megabytes (raw numeric, backward compatible)
+#
+# Usage: stdlib::tmpfs::_parse_size <spec>
+# Prints: size in MB, or empty string for "auto"
+stdlib::tmpfs::_parse_size() {
+  local spec="${1:?size spec required}"
+
+  # "auto" — let the kernel decide
+  if [[ "$spec" == "auto" ]]; then
+    echo ""
+    return 0
+  fi
+
+  # Percentage of RAM — e.g. "50%"
+  if [[ "$spec" =~ ^([0-9]+)%$ ]]; then
+    local pct="${BASH_REMATCH[1]}"
+    local total_kb
+    total_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 2097152)"
+    local total_mb=$((total_kb / 1024))
+    echo $(( total_mb * pct / 100 ))
+    return 0
+  fi
+
+  # Gigabytes — e.g. "2G" or "2g"
+  if [[ "$spec" =~ ^([0-9]+)[gG]$ ]]; then
+    echo $(( ${BASH_REMATCH[1]} * 1024 ))
+    return 0
+  fi
+
+  # Megabytes — e.g. "100M" or "100m"
+  if [[ "$spec" =~ ^([0-9]+)[mM]$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  # Raw numeric — backward compatible (treated as MB)
+  if [[ "$spec" =~ ^[0-9]+$ ]]; then
+    echo "$spec"
+    return 0
+  fi
+
+  printf 'stdlib::tmpfs::_parse_size: invalid size spec: %s\n' "$spec" >&2
+  return 1
+}
 
 # ── stdlib::tmpfs::detect_candidates ──────────────────────────────────
 # Inspect /proc/mounts for tmpfs mount points.
@@ -81,17 +136,26 @@ stdlib::tmpfs::create_workspace() {
 
 # ── stdlib::tmpfs::ensure_mount ───────────────────────────────────────
 # High-level: ensure a tmpfs mount with fstab entry.
-# Usage: stdlib::tmpfs::ensure_mount mountpoint size_mb mode [uid] [gid]
+# Usage: stdlib::tmpfs::ensure_mount mountpoint size_spec mode [uid] [gid]
+#
+# size_spec accepts: "50%", "100M", "2G", "auto", or numeric MB
 # Delegates to stdlib::fstab for the actual fstab/mount work.
 stdlib::tmpfs::ensure_mount() {
   local mountpoint="$1"
-  local size_mb="$2"
+  local size_spec="$2"
   local mode="${3:-1777}"
   local uid="${4:-}"
   local gid="${5:-}"
 
+  # Parse size specification
+  local size_mb
+  size_mb="$(stdlib::tmpfs::_parse_size "$size_spec")"
+
   # Build options string
-  local opts="defaults,noatime,nosuid,nodev,noexec,mode=${mode},size=${size_mb}m"
+  local opts="defaults,noatime,nosuid,nodev,noexec,mode=${mode}"
+  if [[ -n "$size_mb" ]]; then
+    opts+=",size=${size_mb}m"
+  fi
   [[ -n "$uid" ]] && opts+=",uid=${uid}"
   [[ -n "$gid" ]] && opts+=",gid=${gid}"
 
