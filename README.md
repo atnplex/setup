@@ -17,7 +17,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/atnplex/setup/modular/bootst
 
 ## Architecture
 
-```
+```text
 bootstrap.sh              → 66-line thin entrypoint
   └─ lib/stdlib.sh        → module loader (lazy import, once-only)
        └─ lib/core/run.sh → 8-phase orchestrator
@@ -37,18 +37,18 @@ bootstrap.sh              → 66-line thin entrypoint
 
 ## Variables
 
-All values are sourced from `defaults.env`, environment, or CLI flags. Nothing is hard-coded.
+All values are resolved via: BWS project `variables` → `defaults.env` → environment → CLI flags → interactive prompt. Nothing is hard-coded.
 
 ### Core Identity
 
-| Variable          | Default           | Description                   |
-| ----------------- | ----------------- | ----------------------------- |
-| `NAMESPACE`       | `/atn`            | Root namespace path           |
-| `NAMESPACE_ROOT`  | `$NAMESPACE`      | Alias used by stdlib modules  |
-| `BOOTSTRAP_USER`  | (required)        | System user to create/enforce |
-| `BOOTSTRAP_GROUP` | `$BOOTSTRAP_USER` | System group                  |
-| `BOOTSTRAP_UID`   | (required)        | Desired UID                   |
-| `BOOTSTRAP_GID`   | `$BOOTSTRAP_UID`  | Desired GID                   |
+| Variable          | Default          | Description                       |
+| ----------------- | ---------------- | --------------------------------- |
+| `NAMESPACE`       | `atn`            | Namespace name (not a path)       |
+| `NAMESPACE_ROOT`  | `/$NAMESPACE`    | Root path, derived from NAMESPACE |
+| `BOOTSTRAP_USER`  | (required)       | System user to create/enforce     |
+| `BOOTSTRAP_GROUP` | `$NAMESPACE`     | System group                      |
+| `BOOTSTRAP_UID`   | (required)       | Desired UID                       |
+| `BOOTSTRAP_GID`   | `$BOOTSTRAP_UID` | Desired GID                       |
 
 ### Infrastructure
 

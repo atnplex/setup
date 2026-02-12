@@ -93,6 +93,13 @@ stdlib::run::bootstrap_main() {
 
   # ── Phase 1: Resolve variables ──
   _run_log "Phase 1: Resolving variables..."
+
+  # Try BWS project "variables" first (canonical source)
+  if stdlib::config::load_from_bws 2>/dev/null; then
+    _run_ok "Variables loaded from BWS project 'variables'"
+  fi
+
+  # Discover and load local variables file (supplements/overrides BWS)
   local vfile
   vfile="$(stdlib::config::discover_file "$variables_file" 2>/dev/null || true)"
   stdlib::config::resolve_vars "$vfile" "$interactive"

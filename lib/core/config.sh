@@ -179,3 +179,55 @@ SEED_EOF
   sudo chown "${BOOTSTRAP_USER:-root}:${BOOTSTRAP_GROUP:-root}" "$target" 2>/dev/null || true
   chmod 600 "$target" 2>/dev/null || true
 }
+
+# ── stdlib::config::load_from_bws ─────────────────────────────────────
+# Fetch all variables from BWS project "variables" and export them.
+# Optionally writes them to the variables file for future offline runs.
+# Requires: bws CLI + BWS_ACCESS_TOKEN
+# Usage: stdlib::config::load_from_bws [target_file]
+stdlib::config::load_from_bws() {
+  local target="${1:-${VARIABLES_FILE:-}}"
+
+  command -v bws &>/dev/null || return 1
+  [[ -n "${BWS_ACCESS_TOKEN:-}" ]] || return 1
+  command -v jq &>/dev/null || return 1
+
+  # List all projects, find the one named "variables" (case-insensitive)
+  local project_id
+  project_id="$(bws project list 2>/dev/null |
+    jq -r '.[] | select(.name | ascii_downcase == "variables") | .id' 2>/dev/null |
+    head -1)" || return 1
+  [[ -n "$project_id" ]] || return 1
+
+  # Fetch all secrets in that project
+  local secrets_json
+  secrets_json="$(bws secret list --project-id "$project_id" 2>/dev/null)" || return 1
+
+  # Parse and export: each BWS secret key → variable name, value → variable value
+  local count=0 key val
+  while IFS=$'\t' read -r key val; do
+    [[ -z "$key" ]] && continue
+    export "$key=$val"
+    ((count++)) || true
+  done < <(echo "$secrets_json" | jq -r '.[] | [.key, .value] | @tsv' 2>/dev/null)
+
+  [[ $count -eq 0 ]] && return 1
+
+  # Persist to variables file for offline future runs
+  if [[ -n "$target" ]]; then
+    local parent
+    parent="$(dirname "$target")"
+    [[ -d "$parent" ]] || sudo mkdir -p "$parent"
+
+    {
+      printf '# Bootstrap Variables — Fetched from BWS %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf '# Project: variables (%s)\n' "$project_id"
+      echo "$secrets_json" | jq -r '.[] | "\(.key)=\(.value)"' 2>/dev/null
+    } >"$target"
+
+    sudo chown "${BOOTSTRAP_USER:-root}:${BOOTSTRAP_GROUP:-root}" "$target" 2>/dev/null || true
+    chmod 600 "$target" 2>/dev/null || true
+  fi
+
+  return 0
+}
