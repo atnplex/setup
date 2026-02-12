@@ -7,11 +7,12 @@
 declare -g _STDLIB_SECRETS=1
 
 # ── Internal State ─────────────────────────────────────────────────────
-declare -g _SECRETS_DIR="${SECRETS_DIR:-/atn/.ignore/secrets}"
+declare -g _SECRETS_DIR="${SECRETS_DIR:-${NAMESPACE_ROOT:+${NAMESPACE_ROOT}/.ignore/secrets}}"
+_SECRETS_DIR="${_SECRETS_DIR:-/tmp/secrets}" # Absolute fallback
 declare -g _SECRETS_AGE_FILE="${_SECRETS_DIR}/secrets.age"
 declare -g _SECRETS_AGE_KEY="${_SECRETS_DIR}/age.key"
-declare -gA _SECRETS_KNOWN=()      # Tracks all known secret names for persist
-declare -g _SECRETS_KEYRING="atn"   # keyctl session name
+declare -gA _SECRETS_KNOWN=()                   # Tracks all known secret names for persist
+declare -g _SECRETS_KEYRING="${NAMESPACE:-atn}" # keyctl session name
 
 # ── stdlib::secrets::init ──────────────────────────────────────────────
 # Ensure directories exist, age key is present, keyutils available.
@@ -37,7 +38,8 @@ stdlib::secrets::init() {
 # 4-tier secret resolution: env → keyctl → age → BWS
 # Usage: stdlib::secrets::get NAME [bws_keywords...]
 stdlib::secrets::get() {
-  local name="$1"; shift
+  local name="$1"
+  shift
   local value=""
 
   # Tier 1: Environment variable
@@ -92,7 +94,8 @@ stdlib::secrets::set() {
 # ── stdlib::secrets::require ──────────────────────────────────────────
 # Get a secret or fatal exit.
 stdlib::secrets::require() {
-  local name="$1"; shift
+  local name="$1"
+  shift
   local value
   value=$(stdlib::secrets::get "$name" "$@") || {
     echo "FATAL: Required secret '${name}' not found in any tier" >&2
@@ -117,7 +120,7 @@ stdlib::secrets::persist() {
 
   # Write all known secrets as KEY=VALUE
   for name in "${!_SECRETS_KNOWN[@]}"; do
-    printf '%s=%s\n' "$name" "${!name:-}" >> "$tmpfile"
+    printf '%s=%s\n' "$name" "${!name:-}" >>"$tmpfile"
   done
 
   # Encrypt with age
@@ -191,4 +194,72 @@ stdlib::secrets::_bws_fetch() {
   jq_filter+=') | .value'
 
   echo "$secrets_json" | jq -r "$jq_filter" 2>/dev/null | head -1
+}
+
+# ── stdlib::secrets::bootstrap_from_bws ───────────────────────────────
+# Full BWS bootstrap flow: install CLI if missing, ensure token, fetch all
+# secrets, store them, and persist to age file.
+# Usage: stdlib::secrets::bootstrap_from_bws [token]
+stdlib::secrets::bootstrap_from_bws() {
+  local token="${1:-${BWS_ACCESS_TOKEN:-}}"
+
+  # Install BWS if not present
+  if ! command -v bws &>/dev/null; then
+    if command -v npm &>/dev/null; then
+      npm install -g @bitwarden/cli 2>/dev/null || true
+    else
+      echo "WARN: BWS CLI not found and npm unavailable for install" >&2
+      return 1
+    fi
+  fi
+
+  # Token required
+  if [[ -z "$token" ]]; then
+    read -rsp "  BWS access token: " token </dev/tty 2>/dev/null || true
+    echo
+    [[ -z "$token" ]] && return 1
+  fi
+  export BWS_ACCESS_TOKEN="$token"
+
+  # Fetch all secrets
+  local secrets_json
+  secrets_json="$(bws secret list 2>/dev/null)" || return 1
+
+  # Parse and store each secret
+  local count=0
+  while IFS=$'\t' read -r key val; do
+    [[ -z "$key" ]] && continue
+    stdlib::secrets::set "$key" "$val"
+    ((count++)) || true
+  done < <(echo "$secrets_json" | jq -r '.[] | [.key, .value] | @tsv' 2>/dev/null)
+
+  # Persist to age file
+  if [[ $count -gt 0 ]]; then
+    stdlib::secrets::persist
+  fi
+
+  return 0
+}
+
+# ── stdlib::secrets::load_to_tmpdir ───────────────────────────────────
+# Decrypt age file to TMP_DIR as plaintext (for systems without keyctl).
+# The plaintext file is cleaned up by the TMP_DIR EXIT trap.
+# Usage: stdlib::secrets::load_to_tmpdir [tmpdir]
+stdlib::secrets::load_to_tmpdir() {
+  local tmpdir="${1:-${TMP_DIR:-/tmp}}"
+  [[ -f "${_SECRETS_AGE_FILE}" ]] || return 1
+  [[ -f "${_SECRETS_AGE_KEY}" ]] || return 1
+  command -v age &>/dev/null || return 1
+
+  local plain_file="${tmpdir}/secrets.env"
+  age -d -i "${_SECRETS_AGE_KEY}" "${_SECRETS_AGE_FILE}" >"$plain_file" 2>/dev/null || return 1
+  chmod 600 "$plain_file"
+
+  # Source into env
+  local key val
+  while IFS='=' read -r key val; do
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    export "$key=$val"
+    _SECRETS_KNOWN["$key"]=1
+  done <"$plain_file"
 }

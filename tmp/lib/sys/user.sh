@@ -7,7 +7,7 @@
 declare -g _STDLIB_USER=1
 
 # ── Internal State ─────────────────────────────────────────────────────
-declare -g _SUDO_AVAILABLE=""  # cached: "yes", "no", or ""
+declare -g _SUDO_AVAILABLE="" # cached: "yes", "no", or ""
 
 # ── stdlib::user::exists ──────────────────────────────────────────────
 # Check if a user exists on the system.
@@ -44,15 +44,25 @@ stdlib::user::create() {
 # Modify user properties.
 # Usage: stdlib::user::modify name [--uid N] [--groups G] [--shell S]
 stdlib::user::modify() {
-  local name="$1"; shift
+  local name="$1"
+  shift
   local -a args=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --uid)    args+=(-u "$2"); shift 2 ;;
-      --groups) args+=(-aG "$2"); shift 2 ;;
-      --shell)  args+=(-s "$2"); shift 2 ;;
-      *)        shift ;;
+    --uid)
+      args+=(-u "$2")
+      shift 2
+      ;;
+    --groups)
+      args+=(-aG "$2")
+      shift 2
+      ;;
+    --shell)
+      args+=(-s "$2")
+      shift 2
+      ;;
+    *) shift ;;
     esac
   done
 
@@ -142,4 +152,60 @@ stdlib::user::sudo_keepalive() {
     sleep 50
   done &
   disown $!
+}
+
+# ── stdlib::user::ensure_identity ─────────────────────────────────────
+# High-level: ensure a user + group exist with the correct UID/GID.
+# Handles: group create → user create/modify → UID/GID mismatch → sudo → docker group.
+# Usage: stdlib::user::ensure_identity user group uid gid [extra_groups...]
+stdlib::user::ensure_identity() {
+  local user="$1"
+  local group="$2"
+  local uid="$3"
+  local gid="$4"
+  shift 4
+  local -a extra_groups=("$@")
+
+  # ── Group ──
+  if ! stdlib::user::group_exists "$group"; then
+    stdlib::user::group_create "$group" "$gid"
+  else
+    # Verify GID
+    local existing_gid
+    existing_gid="$(getent group "$group" | cut -d: -f3)"
+    if [[ "$existing_gid" != "$gid" ]]; then
+      sudo groupmod -g "$gid" "$group" 2>/dev/null || true
+    fi
+  fi
+
+  # ── User ──
+  if ! stdlib::user::exists "$user"; then
+    stdlib::user::create "$user" "$uid" "$gid"
+  else
+    # Verify UID
+    local existing_uid
+    existing_uid="$(stdlib::user::uid "$user")"
+    if [[ "$existing_uid" != "$uid" ]]; then
+      sudo usermod -u "$uid" "$user" 2>/dev/null || true
+    fi
+    # Verify primary GID
+    local existing_primary_gid
+    existing_primary_gid="$(id -g "$user" 2>/dev/null)"
+    if [[ "$existing_primary_gid" != "$gid" ]]; then
+      sudo usermod -g "$gid" "$user" 2>/dev/null || true
+    fi
+  fi
+
+  # ── Sudo ──
+  stdlib::user::ensure_sudo "$user"
+
+  # ── Extra groups (e.g., docker) ──
+  for grp in "${extra_groups[@]}"; do
+    [[ -z "$grp" ]] && continue
+    if stdlib::user::group_exists "$grp"; then
+      if ! id -nG "$user" 2>/dev/null | grep -qw "$grp"; then
+        sudo usermod -aG "$grp" "$user" 2>/dev/null || true
+      fi
+    fi
+  done
 }
