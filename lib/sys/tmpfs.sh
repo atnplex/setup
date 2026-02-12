@@ -44,7 +44,7 @@ stdlib::tmpfs::_parse_size() {
 
   # Gigabytes — e.g. "2G" or "2g"
   if [[ "$spec" =~ ^([0-9]+)[gG]$ ]]; then
-    echo $(( ${BASH_REMATCH[1]} * 1024 ))
+    echo $(( BASH_REMATCH[1] * 1024 ))
     return 0
   fi
 
