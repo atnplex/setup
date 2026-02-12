@@ -1,96 +1,216 @@
 #!/usr/bin/env bash
 # Module: sys/os
-# Version: 0.1.0
-# Requires: (none)
-# Provides: stdlib::os::name, ::arch, ::distro, ::version, ::is_container, ::capabilities
-# Description: OS, architecture, and distro detection.
+# Version: 0.2.0
+# Provides: OS/arch/distro detection, environment classification
+# Requires: none
+[[ -n "${_STDLIB_OS:-}" ]] && return 0
+declare -g _STDLIB_OS=1
 
-[[ -n "${_STDLIB_LOADED_SYS_OS:-}" ]] && return 0
-readonly _STDLIB_LOADED_SYS_OS=1
-readonly _STDLIB_MOD_VERSION="0.1.0"
+# ── Internal Cache ─────────────────────────────────────────────
+declare -g _OS_NAME=""
+declare -g _OS_ARCH=""
+declare -g _OS_DISTRO=""
+declare -g _OS_VERSION=""
+declare -g _OS_PKG_MGR=""
+declare -g _OS_MACHINE_TYPE=""
 
-# ---------- stdlib::os::name -------------------------------------------------
-# Print normalized OS name: linux, darwin, freebsd, windows, unknown
+# ── stdlib::os::name ──────────────────────────────────────────
+# Returns: linux, darwin, freebsd, etc.
 stdlib::os::name() {
-  local raw
-  raw="$(uname -s 2>/dev/null || echo unknown)"
-  case "${raw,,}" in
-    linux*)   printf 'linux' ;;
-    darwin*)  printf 'darwin' ;;
-    freebsd*) printf 'freebsd' ;;
-    msys*|mingw*|cygwin*) printf 'windows' ;;
-    *)        printf 'unknown' ;;
-  esac
+  [[ -n "$_OS_NAME" ]] && { printf '%s' "$_OS_NAME"; return 0; }
+  _OS_NAME=$(uname -s | tr '[:upper:]' '[:lower:]')
+  printf '%s' "$_OS_NAME"
 }
 
-# ---------- stdlib::os::arch -------------------------------------------------
-# Print normalized architecture: x86_64, aarch64, armv7l, ...
+# ── stdlib::os::arch ──────────────────────────────────────────
+# Normalised architecture: amd64, arm64, armv7, i386
 stdlib::os::arch() {
+  [[ -n "$_OS_ARCH" ]] && { printf '%s' "$_OS_ARCH"; return 0; }
   local raw
-  raw="$(uname -m 2>/dev/null || echo unknown)"
+  raw=$(uname -m)
   case "$raw" in
-    x86_64|amd64)  printf 'x86_64' ;;
-    aarch64|arm64) printf 'aarch64' ;;
-    armv7l|armhf)  printf 'armv7l' ;;
-    *)             printf '%s' "$raw" ;;
+    x86_64|amd64)   _OS_ARCH="amd64" ;;
+    aarch64|arm64)   _OS_ARCH="arm64" ;;
+    armv7l|armhf)    _OS_ARCH="armv7" ;;
+    i686|i386)       _OS_ARCH="i386"  ;;
+    *)               _OS_ARCH="$raw"  ;;
   esac
+  printf '%s' "$_OS_ARCH"
 }
 
-# ---------- stdlib::os::distro -----------------------------------------------
-# Print distro ID: debian, ubuntu, alpine, rhel, fedora, arch, opensuse, ...
+# ── stdlib::os::distro ────────────────────────────────────────
 stdlib::os::distro() {
+  [[ -n "$_OS_DISTRO" ]] && { printf '%s' "$_OS_DISTRO"; return 0; }
   if [[ -f /etc/os-release ]]; then
-    # shellcheck source=/dev/null
-    local ID=""
-    source /etc/os-release 2>/dev/null
-    printf '%s' "${ID:-unknown}"
-  elif [[ -f /etc/redhat-release ]]; then
-    printf 'rhel'
-  elif [[ -f /etc/alpine-release ]]; then
-    printf 'alpine'
+    # shellcheck disable=SC1091
+    _OS_DISTRO=$(. /etc/os-release && echo "${ID:-unknown}")
+  elif command -v sw_vers &>/dev/null; then
+    _OS_DISTRO="macos"
   else
-    printf 'unknown'
+    _OS_DISTRO="unknown"
   fi
+  printf '%s' "$_OS_DISTRO"
 }
 
-# ---------- stdlib::os::version ----------------------------------------------
-# Print distro version string.
+# ── stdlib::os::version ───────────────────────────────────────
 stdlib::os::version() {
+  [[ -n "$_OS_VERSION" ]] && { printf '%s' "$_OS_VERSION"; return 0; }
   if [[ -f /etc/os-release ]]; then
-    local VERSION_ID=""
-    # shellcheck source=/dev/null
-    source /etc/os-release 2>/dev/null
-    printf '%s' "${VERSION_ID:-unknown}"
+    # shellcheck disable=SC1091
+    _OS_VERSION=$(. /etc/os-release && echo "${VERSION_ID:-unknown}")
+  elif command -v sw_vers &>/dev/null; then
+    _OS_VERSION=$(sw_vers -productVersion)
   else
-    uname -r
+    _OS_VERSION="unknown"
   fi
+  printf '%s' "$_OS_VERSION"
 }
 
-# ---------- stdlib::os::is_container -----------------------------------------
-# Returns 0 if running inside a container (Docker, Podman, LXC).
+# ── stdlib::os::is_container ──────────────────────────────────
 stdlib::os::is_container() {
-  # Check for .dockerenv
   [[ -f /.dockerenv ]] && return 0
-  # Check for container env
+  grep -qsE '(docker|lxc|containerd)' /proc/1/cgroup 2>/dev/null && return 0
   [[ -n "${container:-}" ]] && return 0
-  # Check cgroup
-  grep -qE '(docker|lxc|kubepods|containerd)' /proc/1/cgroup 2>/dev/null && return 0
-  # Check for podman
-  [[ -f /run/.containerenv ]] && return 0
   return 1
 }
 
-# ---------- stdlib::os::capabilities -----------------------------------------
-# Emit a JSON object describing environment capabilities.
+# ── stdlib::os::capabilities ──────────────────────────────────
+# Emit JSON of detected capabilities.
 stdlib::os::capabilities() {
-  local os arch distro ver container="false" bash_ver
-  os="$(stdlib::os::name)"
-  arch="$(stdlib::os::arch)"
-  distro="$(stdlib::os::distro)"
-  ver="$(stdlib::os::version)"
-  bash_ver="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}.${BASH_VERSINFO[2]}"
-  stdlib::os::is_container && container="true"
+  cat <<-EOF
+{
+  "os": "$(stdlib::os::name)",
+  "arch": "$(stdlib::os::arch)",
+  "distro": "$(stdlib::os::distro)",
+  "version": "$(stdlib::os::version)",
+  "container": $(stdlib::os::is_container && echo true || echo false),
+  "pkg_manager": "$(stdlib::os::pkg_manager)",
+  "machine_type": "$(stdlib::os::machine_type)",
+  "hostname": "$(stdlib::os::hostname)",
+  "memory_kb": $(stdlib::os::memory_kb),
+  "cpu_count": $(stdlib::os::cpu_count)
+}
+EOF
+}
 
-  printf '{"os":"%s","arch":"%s","distro":"%s","distro_version":"%s","bash_version":"%s","container":%s,"user":"%s","pid":%d}\n' \
-    "$os" "$arch" "$distro" "$ver" "$bash_ver" "$container" "$(whoami)" "$$"
+# ══════════════════════════════════════════════════════════════
+# NEW FUNCTIONS (v0.2.0)
+# ══════════════════════════════════════════════════════════════
+
+# ── stdlib::os::pkg_manager ───────────────────────────────────
+# Detect the system package manager (cached).
+# Returns: apt, dnf, yum, pacman, apk, zypper, brew
+stdlib::os::pkg_manager() {
+  [[ -n "$_OS_PKG_MGR" ]] && { printf '%s' "$_OS_PKG_MGR"; return 0; }
+
+  local -a candidates=(apt-get dnf yum pacman apk zypper brew)
+  for cmd in "${candidates[@]}"; do
+    if command -v "$cmd" &>/dev/null; then
+      _OS_PKG_MGR="$cmd"
+      [[ "$_OS_PKG_MGR" == "apt-get" ]] && _OS_PKG_MGR="apt"
+      printf '%s' "$_OS_PKG_MGR"
+      return 0
+    fi
+  done
+
+  _OS_PKG_MGR="unknown"
+  printf '%s' "$_OS_PKG_MGR"
+}
+
+# ── stdlib::os::machine_type ──────────────────────────────────
+# Detect physical/virtual/cloud environment.
+# Returns: cloud, vm, container, wsl, bare
+stdlib::os::machine_type() {
+  [[ -n "$_OS_MACHINE_TYPE" ]] && { printf '%s' "$_OS_MACHINE_TYPE"; return 0; }
+
+  # Container check first
+  if stdlib::os::is_container; then
+    _OS_MACHINE_TYPE="container"
+    printf '%s' "$_OS_MACHINE_TYPE"
+    return 0
+  fi
+
+  # WSL check
+  if [[ -f /proc/version ]] && grep -qi 'microsoft\|wsl' /proc/version 2>/dev/null; then
+    _OS_MACHINE_TYPE="wsl"
+    printf '%s' "$_OS_MACHINE_TYPE"
+    return 0
+  fi
+
+  # VM/Cloud detection via DMI (requires root or readable DMI)
+  local vendor=""
+  if [[ -r /sys/class/dmi/id/sys_vendor ]]; then
+    vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  fi
+
+  case "$vendor" in
+    *oracle*)          _OS_MACHINE_TYPE="cloud" ;;
+    *amazon*|*ec2*)    _OS_MACHINE_TYPE="cloud" ;;
+    *google*)          _OS_MACHINE_TYPE="cloud" ;;
+    *microsoft*)       _OS_MACHINE_TYPE="cloud" ;;
+    *hetzner*)         _OS_MACHINE_TYPE="cloud" ;;
+    *digitalocean*)    _OS_MACHINE_TYPE="cloud" ;;
+    *vmware*)          _OS_MACHINE_TYPE="vm"    ;;
+    *qemu*|*kvm*|*bochs*) _OS_MACHINE_TYPE="vm" ;;
+    *virtualbox*)      _OS_MACHINE_TYPE="vm"    ;;
+    *xen*)             _OS_MACHINE_TYPE="vm"    ;;
+    *)
+      if command -v systemd-detect-virt &>/dev/null; then
+        local virt
+        virt=$(systemd-detect-virt 2>/dev/null || echo "none")
+        if [[ "$virt" == "none" ]]; then
+          _OS_MACHINE_TYPE="bare"
+        else
+          _OS_MACHINE_TYPE="vm"
+        fi
+      else
+        _OS_MACHINE_TYPE="bare"
+      fi
+      ;;
+  esac
+
+  printf '%s' "$_OS_MACHINE_TYPE"
+}
+
+# ── stdlib::os::vendor ────────────────────────────────────────
+# Returns the hardware/cloud vendor name.
+stdlib::os::vendor() {
+  local vendor=""
+  if [[ -r /sys/class/dmi/id/sys_vendor ]]; then
+    cat /sys/class/dmi/id/sys_vendor 2>/dev/null
+  elif [[ -r /sys/class/dmi/id/board_vendor ]]; then
+    cat /sys/class/dmi/id/board_vendor 2>/dev/null
+  else
+    echo "unknown"
+  fi
+}
+
+# ── stdlib::os::hostname ──────────────────────────────────────
+# Current hostname (normalized, lowercase).
+stdlib::os::hostname() {
+  hostname 2>/dev/null | tr '[:upper:]' '[:lower:]'
+}
+
+# ── stdlib::os::memory_kb ─────────────────────────────────────
+# Total RAM in KB.
+stdlib::os::memory_kb() {
+  if [[ -f /proc/meminfo ]]; then
+    awk '/^MemTotal:/ {print $2}' /proc/meminfo
+  elif command -v sysctl &>/dev/null; then
+    sysctl -n hw.memsize 2>/dev/null | awk '{print int($1/1024)}'
+  else
+    echo 0
+  fi
+}
+
+# ── stdlib::os::cpu_count ─────────────────────────────────────
+# Number of CPUs/cores.
+stdlib::os::cpu_count() {
+  nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1
+}
+
+# ── stdlib::os::is_wsl ────────────────────────────────────────
+# Returns 0 if running under WSL.
+stdlib::os::is_wsl() {
+  [[ -f /proc/version ]] && grep -qi 'microsoft\|wsl' /proc/version 2>/dev/null
 }
