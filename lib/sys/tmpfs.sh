@@ -1,196 +1,130 @@
 #!/usr/bin/env bash
-# Module: sys/tmpfs
-# Version: 0.3.0
-# Provides: Tmpfs detection, workspace selection, TMP_DIR contract,
-#           percentage/unit-aware size parsing
-# Requires: none
-[[ -n "${_STDLIB_TMPFS:-}" ]] && return 0
-declare -g _STDLIB_TMPFS=1
-declare -g _STDLIB_MOD_VERSION="0.3.0"
+# ═══════════════════════════════════════════════════════════════════════
+# sys/tmpfs.sh — Tmpfs detection, workspace creation, and mount management
+# ═══════════════════════════════════════════════════════════════════════
+[[ -n "${_STDLIB_MOD_TMPFS:-}" ]] && return 0
+readonly _STDLIB_MOD_TMPFS=1
+_STDLIB_MOD_VERSION="1.0.0"
 
-# ── Internal State ─────────────────────────────────────────────────────
-declare -g TMP_DIR="" # Exported after create_workspace
+stdlib::import core/log
 
-# ── stdlib::tmpfs::_parse_size ────────────────────────────────────────
-# Parse a size specification into megabytes.
-#
-# Supported formats:
-#   "50%"   → 50% of total RAM (from /proc/meminfo MemTotal)
-#   "100M"  → 100 megabytes
-#   "2G"    → 2048 megabytes
-#   "auto"  → returns empty string (caller omits size= from mount opts)
-#   "1024"  → 1024 megabytes (raw numeric, backward compatible)
-#
-# Usage: stdlib::tmpfs::_parse_size <spec>
-# Prints: size in MB, or empty string for "auto"
-stdlib::tmpfs::_parse_size() {
-  local spec="${1:?size spec required}"
-
-  # "auto" — let the kernel decide
-  if [[ "$spec" == "auto" ]]; then
-    echo ""
-    return 0
-  fi
-
-  # Percentage of RAM — e.g. "50%"
-  if [[ "$spec" =~ ^([0-9]+)%$ ]]; then
-    local pct="${BASH_REMATCH[1]}"
-    local total_kb
-    total_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 2097152)"
-    local total_mb=$((total_kb / 1024))
-    echo $(( total_mb * pct / 100 ))
-    return 0
-  fi
-
-  # Gigabytes — e.g. "2G" or "2g"
-  if [[ "$spec" =~ ^([0-9]+)[gG]$ ]]; then
-    echo $(( BASH_REMATCH[1] * 1024 ))
-    return 0
-  fi
-
-  # Megabytes — e.g. "100M" or "100m"
-  if [[ "$spec" =~ ^([0-9]+)[mM]$ ]]; then
-    echo "${BASH_REMATCH[1]}"
-    return 0
-  fi
-
-  # Raw numeric — backward compatible (treated as MB)
-  if [[ "$spec" =~ ^[0-9]+$ ]]; then
-    echo "$spec"
-    return 0
-  fi
-
-  printf 'stdlib::tmpfs::_parse_size: invalid size spec: %s\n' "$spec" >&2
-  return 1
-}
-
-# ── stdlib::tmpfs::detect_candidates ──────────────────────────────────
-# Inspect /proc/mounts for tmpfs mount points.
-# Returns newline-separated list of tmpfs mountpoints.
+# ── Detect tmpfs mount candidates ────────────────────────────────────
 stdlib::tmpfs::detect_candidates() {
-  awk '$3 == "tmpfs" {print $2}' /proc/mounts 2>/dev/null | sort -u
+  _TMPFS_CANDIDATES=()
+
+  if [[ ! -f /proc/mounts ]]; then
+    stdlib::log::warn "No /proc/mounts — tmpfs detection unavailable"
+    return 1
+  fi
+
+  local _dev mp fstype _opts _dump _pass
+  while read -r _dev mp fstype _opts _dump _pass; do
+    if [[ "${fstype}" == "tmpfs" && -d "${mp}" && -w "${mp}" ]]; then
+      local size_kb
+      size_kb="$(df -k "${mp}" 2>/dev/null | awk 'NR==2{print $4}')" || continue
+      _TMPFS_CANDIDATES+=("${mp}:${size_kb:-0}")
+    fi
+  done < /proc/mounts
 }
 
-# ── stdlib::tmpfs::select_best ────────────────────────────────────────
-# Choose the best tmpfs mount point for temporary workspace.
-# Priority: 1) $NAMESPACE_ROOT_DIR/tmp (if exists & tmpfs)
-#           2) /dev/shm
-#           3) /run
-#           4) /tmp
-# Requirements: writable, >= 50MB free
-# Usage: stdlib::tmpfs::select_best [namespace_root]
+# ── Select the best (largest available) tmpfs ────────────────────────
 stdlib::tmpfs::select_best() {
-  local ns_root="${1:-}"
-  local min_free_kb=51200 # 50MB minimum
+  stdlib::tmpfs::detect_candidates
 
-  # Build preference list
-  local -a candidates=()
-  [[ -n "$ns_root" ]] && candidates+=("${ns_root}/tmp")
-  candidates+=(/dev/shm /run /tmp)
-
-  # Get actual tmpfs mounts
-  local tmpfs_mounts
-  tmpfs_mounts="$(stdlib::tmpfs::detect_candidates)"
-
-  for candidate in "${candidates[@]}"; do
-    # Must be a tmpfs mount
-    if ! echo "$tmpfs_mounts" | grep -qx "$candidate"; then
-      continue
-    fi
-
-    # Must be writable
-    [[ -w "$candidate" ]] || continue
-
-    # Must have sufficient free space
-    local free_kb
-    free_kb="$(df -k "$candidate" 2>/dev/null | awk 'NR==2 {print $4}')"
-    [[ -n "$free_kb" && "$free_kb" -ge "$min_free_kb" ]] || continue
-
-    echo "$candidate"
+  if [[ ${#_TMPFS_CANDIDATES[@]} -eq 0 ]]; then
+    stdlib::log::warn "No writable tmpfs found — falling back to /tmp"
+    _BEST_TMPFS="/tmp"
     return 0
+  fi
+
+  local best_mp="/tmp"
+  local best_size=0
+  local entry
+  for entry in "${_TMPFS_CANDIDATES[@]}"; do
+    local mp="${entry%%:*}"
+    local size="${entry##*:}"
+    if [[ "${size}" -gt "${best_size}" ]]; then
+      best_size="${size}"
+      best_mp="${mp}"
+    fi
   done
 
-  # Fallback: /tmp even if not tmpfs (always available)
-  echo "/tmp"
+  _BEST_TMPFS="${best_mp}"
+  stdlib::log::info "Selected tmpfs: ${_BEST_TMPFS} (${best_size}KB free)"
 }
 
-# ── stdlib::tmpfs::create_workspace ───────────────────────────────────
-# Create a unique temporary workspace directory on the best tmpfs.
-# Exports TMP_DIR and registers cleanup on EXIT.
-# Usage: stdlib::tmpfs::create_workspace [namespace_root] [prefix]
+# ── Create workspace on tmpfs + register cleanup trap ────────────────
 stdlib::tmpfs::create_workspace() {
-  local ns_root="${1:-}"
-  local prefix="${2:-bootstrap}"
+  stdlib::tmpfs::select_best
 
-  local base
-  base="$(stdlib::tmpfs::select_best "$ns_root")"
-
-  TMP_DIR="$(mktemp -d "${base}/${prefix}-XXXXXX")"
+  TMP_DIR="$(mktemp -d "${_BEST_TMPFS}/bootstrap-XXXXXX")"
   export TMP_DIR
 
-  # Register cleanup — use eval-based trap so TMP_DIR is expanded at signal time
-  trap 'rm -rf "${TMP_DIR}" 2>/dev/null || true' EXIT
-  trap 'rm -rf "${TMP_DIR}" 2>/dev/null || true; exit 130' INT
-  trap 'rm -rf "${TMP_DIR}" 2>/dev/null || true; exit 143' TERM
+  # shellcheck disable=SC2064
+  trap "rm -rf '${TMP_DIR}'" EXIT
+
+  stdlib::log::info "Workspace: ${TMP_DIR}"
 }
 
-# ── stdlib::tmpfs::ensure_mount ───────────────────────────────────────
-# High-level: ensure a tmpfs mount with fstab entry.
-# Usage: stdlib::tmpfs::ensure_mount mountpoint size_spec mode [uid] [gid]
-#
-# size_spec accepts: "50%", "100M", "2G", "auto", or numeric MB
-# Delegates to stdlib::fstab for the actual fstab/mount work.
-#
-# NOTE: noexec is intentionally omitted — scripts may run from tmpfs.
-stdlib::tmpfs::ensure_mount() {
-  local mountpoint="$1"
-  local size_spec="$2"
-  local mode="${3:-1777}"
-  local uid="${4:-}"
-  local gid="${5:-}"
+# ── Ensure permanent tmpfs mounts (fstab + mount) ────────────────────
+stdlib::tmpfs::ensure_mounts() {
+  local ns_root="${NAMESPACE_ROOT:?NAMESPACE_ROOT not set}"
 
-  # Parse size specification
-  local size_mb
-  size_mb="$(stdlib::tmpfs::_parse_size "$size_spec")"
+  _tmpfs_ensure_mount "${ns_root}/tmp"  "50%" "1777"
+  _tmpfs_ensure_mount "${ns_root}/logs" "1G"  "0775"
+}
 
-  # Build options string (no noexec — scripts may execute from tmpfs)
-  local opts="defaults,noatime,nosuid,nodev,mode=${mode}"
-  if [[ -n "$size_mb" ]]; then
-    opts+=",size=${size_mb}m"
-  fi
-  [[ -n "$uid" ]] && opts+=",uid=${uid}"
-  [[ -n "$gid" ]] && opts+=",gid=${gid}"
+# ── Internal: ensure a single tmpfs mount ────────────────────────────
+_tmpfs_ensure_mount() {
+  local mount_point="$1"
+  local size="$2"
+  local mode="$3"
 
-  local fstab_line="tmpfs  ${mountpoint}  tmpfs  ${opts}  0  0"
-
-  # Ensure directory exists
-  if [[ ! -d "$mountpoint" ]]; then
-    sudo mkdir -p "$mountpoint"
-  fi
-
-  # Delegate to fstab module if loaded, otherwise inline
-  if declare -F stdlib::fstab::ensure_entry &>/dev/null; then
-    stdlib::fstab::ensure_entry "tmpfs" "$mountpoint" "tmpfs" "$opts"
+  local size_opt
+  if [[ "${size}" == *% ]]; then
+    local pct="${size%\%}"
+    local ram_kb
+    ram_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
+    local size_kb=$(( ram_kb * pct / 100 ))
+    size_opt="${size_kb}k"
   else
-    # Inline fallback: add if missing, update if stale
-    if grep -qsE "\\s${mountpoint}\\s" /etc/fstab; then
-      local current
-      current="$(grep -E "\\s${mountpoint}\\s" /etc/fstab)"
-      if [[ "$current" != "$fstab_line" ]]; then
-        sudo sed -i "\\|\\s${mountpoint}\\s|c\\${fstab_line}" /etc/fstab
-      fi
+    local ram_kb
+    ram_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
+    local max_kb=$(( ram_kb / 2 ))
+    local req_kb
+    req_kb="$(_tmpfs_parse_size "${size}")"
+    if [[ "${req_kb}" -gt "${max_kb}" ]]; then
+      size_opt="${max_kb}k"
     else
-      echo "$fstab_line" | sudo tee -a /etc/fstab >/dev/null
+      size_opt="${req_kb}k"
     fi
   fi
 
-  # Mount if not already mounted
-  if ! mount | grep -qs " on ${mountpoint} "; then
-    sudo mount "$mountpoint" 2>/dev/null || sudo mount -a
+  mkdir -p "${mount_point}"
+
+  local fstab_line="tmpfs ${mount_point} tmpfs defaults,noatime,nosuid,nodev,mode=${mode},size=${size_opt} 0 0"
+  if ! grep -qF "${mount_point}" /etc/fstab 2>/dev/null; then
+    printf '%s\n' "${fstab_line}" >> /etc/fstab
+    stdlib::log::info "Added fstab entry: ${mount_point} (${size_opt})"
   fi
 
-  # Set ownership after mount
-  if [[ -n "$uid" ]]; then
-    sudo chown "${uid}:${gid:-$uid}" "$mountpoint" 2>/dev/null || true
+  if ! mountpoint -q "${mount_point}" 2>/dev/null; then
+    mount "${mount_point}"
+    stdlib::log::info "Mounted: ${mount_point}"
+  else
+    stdlib::log::info "Already mounted: ${mount_point}"
   fi
+
+  chmod "${mode}" "${mount_point}"
+}
+
+# ── Internal: parse size string to KB ────────────────────────────────
+_tmpfs_parse_size() {
+  local size="$1"
+  case "${size}" in
+    *[Gg]) echo $(( ${size%[Gg]} * 1024 * 1024 )) ;;
+    *[Mm]) echo $(( ${size%[Mm]} * 1024 )) ;;
+    *[Kk]) echo "${size%[Kk]}" ;;
+    *)     echo "${size}" ;;
+  esac
 }

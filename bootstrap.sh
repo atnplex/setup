@@ -1,61 +1,64 @@
 #!/usr/bin/env bash
-# ╔═══════════════════════════════════════════════════════════════════╗
-# ║  bootstrap.sh — Thin entrypoint for modular system bootstrap     ║
-# ║                                                                   ║
-# ║  This script performs ONLY:                                       ║
-# ║    1. Bash version check                                          ║
-# ║    2. CLI flag parsing                                            ║
-# ║    3. Repo clone/discovery                                        ║
-# ║    4. stdlib sourcing                                             ║
-# ║    5. Delegation to stdlib::run::bootstrap_main                   ║
-# ║                                                                   ║
-# ║  All business logic lives in lib/core/run.sh                      ║
-# ╚═══════════════════════════════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════════════════
+# bootstrap.sh — Thin entrypoint for modular system bootstrap
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/atnplex/setup/modular/bootstrap.sh | sudo bash
+#
+# This script performs ONLY:
+#   1. Bash 4+ / root check
+#   2. Create minimal temp workspace
+#   3. Clone or discover the setup repo
+#   4. Source stdlib.sh
+#   5. Delegate to stdlib::run::bootstrap_main
+#
+# All business logic lives in lib/core/run.sh
+# ═══════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# ── Bash 4+ required ─────────────────────────────────────────────────
+# ── Bash 4+ required ────────────────────────────────────────────────
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
-  echo "FATAL: Bash 4+ required (found ${BASH_VERSION})" >&2
+  printf 'FATAL: Bash 4+ required (found %s)\n' "${BASH_VERSION}" >&2
   exit 1
 fi
 
-# ── Resolve script location ──────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# ── Locate or clone stdlib ───────────────────────────────────────────
-find_stdlib() {
-  # 1. Relative to script (running from repo checkout)
-  if [[ -f "${SCRIPT_DIR}/lib/stdlib.sh" ]]; then
-    echo "${SCRIPT_DIR}/lib"
-    return 0
-  fi
-
-  # 2. Parent directory (script in sub-folder)
-  if [[ -f "${SCRIPT_DIR}/../lib/stdlib.sh" ]]; then
-    (cd "${SCRIPT_DIR}/../lib" && pwd)
-    return 0
-  fi
-
-  # 3. Clone into temp directory
-  local clone_dir
-  clone_dir="$(mktemp -d "${TMPDIR:-/tmp}/setup-XXXXXX")"
-  echo "Cloning setup repo into ${clone_dir}..." >&2
-  git clone --depth 1 --branch modular \
-    "https://github.com/${GH_ORG:-atnplex}/setup.git" \
-    "${clone_dir}" 2>&1 | tail -1 >&2
-  echo "${clone_dir}/lib"
-}
-
-STDLIB_ROOT="$(find_stdlib)"
-export STDLIB_ROOT
-
-# ── Validate stdlib exists ───────────────────────────────────────────
-if [[ ! -f "${STDLIB_ROOT}/stdlib.sh" ]]; then
-  echo "FATAL: stdlib.sh not found at ${STDLIB_ROOT}" >&2
+# ── Root required ────────────────────────────────────────────────────
+if [[ "$(id -u)" -ne 0 ]]; then
+  printf 'FATAL: Must run as root\n' >&2
   exit 1
 fi
 
-# ── Source stdlib + import orchestrator ────────────────────────────────
+# ── Configuration ────────────────────────────────────────────────────
+readonly _BOOT_REPO_URL="https://github.com/${GH_ORG:-atnplex}/setup.git"
+readonly _BOOT_REPO_BRANCH="${REPO_BRANCH:-modular}"
+
+# ── Minimal temp workspace ───────────────────────────────────────────
+_BOOT_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/bootstrap-XXXXXX")"
+readonly _BOOT_TMPDIR
+trap 'rm -rf "${_BOOT_TMPDIR}"' EXIT
+
+# ── Locate or clone the setup repo ───────────────────────────────────
+_BOOT_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -n "${SETUP_REPO_DIR:-}" && -f "${SETUP_REPO_DIR}/lib/stdlib.sh" ]]; then
+  REPO_DIR="${SETUP_REPO_DIR}"
+elif [[ -f "${_BOOT_SCRIPT_DIR}/lib/stdlib.sh" ]]; then
+  REPO_DIR="${_BOOT_SCRIPT_DIR}"
+else
+  REPO_DIR="${_BOOT_TMPDIR}/setup"
+  printf 'Cloning %s (branch: %s)...\n' "${_BOOT_REPO_URL}" "${_BOOT_REPO_BRANCH}" >&2
+  git clone --depth 1 --branch "${_BOOT_REPO_BRANCH}" \
+    "${_BOOT_REPO_URL}" "${REPO_DIR}" >/dev/null 2>&1
+fi
+export REPO_DIR
+
+# ── Validate + source stdlib ────────────────────────────────────────
+if [[ ! -f "${REPO_DIR}/lib/stdlib.sh" ]]; then
+  printf 'FATAL: stdlib.sh not found at %s/lib\n' "${REPO_DIR}" >&2
+  exit 1
+fi
+
+export STDLIB_ROOT="${REPO_DIR}/lib"
 # shellcheck source=lib/stdlib.sh
 source "${STDLIB_ROOT}/stdlib.sh"
 stdlib::import core/run
