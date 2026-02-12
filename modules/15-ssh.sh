@@ -79,9 +79,11 @@ fi
 chmod 600 "${ssh_dir}/authorized_keys"
 chown "${SYSTEM_USERNAME}:${SYSTEM_GROUPNAME}" "${ssh_dir}/authorized_keys"
 
-# If namespace has SSH configs, link them
-if [[ -d "${NAMESPACE_ROOT_DIR}/configs/ssh" ]]; then
-  for cfg_file in "${NAMESPACE_ROOT_DIR}/configs/ssh/"*; do
+# If namespace has SSH configs, link them (graceful skip if missing)
+ssh_config_dir="${NAMESPACE_ROOT_DIR}/configs/ssh"
+if [[ -d "$ssh_config_dir" ]]; then
+  _linked=0
+  for cfg_file in "${ssh_config_dir}/"*; do
     [[ -f "$cfg_file" ]] || continue
     local_name="$(basename "$cfg_file")"
     target="${ssh_dir}/${local_name}"
@@ -89,9 +91,17 @@ if [[ -d "${NAMESPACE_ROOT_DIR}/configs/ssh" ]]; then
     if [[ ! -e "$target" ]] || [[ -L "$target" ]]; then
       ln -sfn "$cfg_file" "$target"
       chown -h "${SYSTEM_USERNAME}:${SYSTEM_GROUPNAME}" "$target"
+      ((_linked++)) || true
     fi
   done
-  echo "[15-ssh] ✓ SSH configs linked from ${NAMESPACE_ROOT_DIR}/configs/ssh/"
+  if (( _linked > 0 )); then
+    echo "[15-ssh] ✓ Linked ${_linked} SSH config(s) from ${ssh_config_dir}/"
+  else
+    echo "[15-ssh] ℹ SSH config dir exists but contains no files"
+  fi
+  unset _linked
+else
+  echo "[15-ssh] ℹ No SSH configs at ${ssh_config_dir} — skipping symlinks"
 fi
 
 # ── 3. Harden sshd_config (idempotent) ───────────────────────────────

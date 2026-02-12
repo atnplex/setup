@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Module: sys/tmpfs
-# Version: 0.2.0
+# Version: 0.3.0
 # Provides: Tmpfs detection, workspace selection, TMP_DIR contract,
 #           percentage/unit-aware size parsing
 # Requires: none
 [[ -n "${_STDLIB_TMPFS:-}" ]] && return 0
 declare -g _STDLIB_TMPFS=1
-declare -g _STDLIB_MOD_VERSION="0.2.0"
+declare -g _STDLIB_MOD_VERSION="0.3.0"
 
 # ── Internal State ─────────────────────────────────────────────────────
 declare -g TMP_DIR="" # Exported after create_workspace
@@ -140,6 +140,8 @@ stdlib::tmpfs::create_workspace() {
 #
 # size_spec accepts: "50%", "100M", "2G", "auto", or numeric MB
 # Delegates to stdlib::fstab for the actual fstab/mount work.
+#
+# NOTE: noexec is intentionally omitted — scripts may run from tmpfs.
 stdlib::tmpfs::ensure_mount() {
   local mountpoint="$1"
   local size_spec="$2"
@@ -151,7 +153,7 @@ stdlib::tmpfs::ensure_mount() {
   local size_mb
   size_mb="$(stdlib::tmpfs::_parse_size "$size_spec")"
 
-  # Build options string
+  # Build options string (no noexec — scripts may execute from tmpfs)
   local opts="defaults,noatime,nosuid,nodev,mode=${mode}"
   if [[ -n "$size_mb" ]]; then
     opts+=",size=${size_mb}m"

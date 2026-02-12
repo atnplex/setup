@@ -1,47 +1,36 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════
 # run.sh — Modular bootstrap runner
+# Purpose: Load configuration, derive variables, execute modules in order
 #
-# Loads variables, exports TMPDIR early, then executes modules/*.sh
-# in numeric sort order.
-#
-# Usage: sudo bash run.sh [--dry-run]
+# Config load chain:
+#   1. defaults.env        — generic defaults (no identity values)
+#   2. variables.env       — from BWS / operator overrides
+#   3. secrets.env         — from BWS
+#   4. global.conf         — user overrides (highest priority)
 # ══════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── Bash 4+ required ─────────────────────────────────────────────────
-if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
-  echo "FATAL: Bash 4+ required (found ${BASH_VERSION})" >&2
-  exit 1
-fi
-
-# ── Load defaults ─────────────────────────────────────────────────────
+# ── 1. Load defaults.env (generic, no identity values) ───────────────
 if [[ -f "${SCRIPT_DIR}/defaults.env" ]]; then
   # shellcheck source=defaults.env
   source "${SCRIPT_DIR}/defaults.env"
 fi
 
-# ── Discover and load variables.env ───────────────────────────────────
+# Derive namespace root immediately (other paths depend on it)
 NAMESPACE="${NAMESPACE:-atn}"
 NAMESPACE_ROOT_DIR="/${NAMESPACE}"
 export NAMESPACE NAMESPACE_ROOT_DIR
 
-# Derive identity variables with safe defaults
-export SYSTEM_USERNAME="${SYSTEM_USERNAME:-${NAMESPACE}plex}"
-export SYSTEM_GROUPNAME="${SYSTEM_GROUPNAME:-${SYSTEM_USERNAME}}"
-export SYSTEM_USER_UID="${SYSTEM_USER_UID:-1234}"
-export SYSTEM_GROUP_GID="${SYSTEM_GROUP_GID:-${SYSTEM_USER_UID}}"
-
-# Try loading variables.env from standard locations
+# ── 2. Load variables.env (from BWS or operator) ────────────────────
 for _vars_candidate in \
   "${NAMESPACE_ROOT_DIR}/.ignore/variables.env" \
   "${NAMESPACE_ROOT_DIR}/configs/variables.env" \
   "${SCRIPT_DIR}/variables.env"; do
   if [[ -f "$_vars_candidate" ]]; then
     echo "📄 Loading variables from ${_vars_candidate}"
-    # Safe line-by-line load (no eval)
     while IFS='=' read -r key value; do
       [[ -z "$key" || "$key" == \#* ]] && continue
       key="$(echo "$key" | xargs)"
@@ -53,11 +42,49 @@ for _vars_candidate in \
 done
 unset _vars_candidate
 
-# ── Early TMPDIR export ──────────────────────────────────────────────
-# Prefer our tmpfs workspace if available
-if [ -d "$NAMESPACE_ROOT_DIR/tmp" ]; then
-    export TMPDIR="$NAMESPACE_ROOT_DIR/tmp"
-    echo "⚡ Using RAM Disk at $TMPDIR"
+# ── 3. Load secrets.env (from BWS) ──────────────────────────────────
+for _secrets_candidate in \
+  "${NAMESPACE_ROOT_DIR}/.ignore/secrets.env" \
+  "${NAMESPACE_ROOT_DIR}/configs/secrets.env"; do
+  if [[ -f "$_secrets_candidate" ]]; then
+    echo "🔐 Loading secrets from ${_secrets_candidate}"
+    while IFS='=' read -r key value; do
+      [[ -z "$key" || "$key" == \#* ]] && continue
+      key="$(echo "$key" | xargs)"
+      value="$(echo "$value" | xargs | sed "s/^[\"']//;s/[\"']$//")"
+      export "$key=$value"
+    done < "$_secrets_candidate"
+    break
+  fi
+done
+unset _secrets_candidate
+
+# ── 4. Load global.conf (user overrides — highest priority) ─────────
+if [[ -f "${NAMESPACE_ROOT_DIR}/configs/global.conf" ]]; then
+  echo "📋 Loading overrides from ${NAMESPACE_ROOT_DIR}/configs/global.conf"
+  while IFS='=' read -r key value; do
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    key="$(echo "$key" | xargs)"
+    value="$(echo "$value" | xargs | sed "s/^[\"']//;s/[\"']$//")"
+    export "$key=$value"
+  done < "${NAMESPACE_ROOT_DIR}/configs/global.conf"
+fi
+
+# ── 5. Derive identity AFTER all config sources loaded ──────────────
+# SYSTEM_USERNAME comes from variables.env/BWS; fall back to NAMESPACE+plex
+export SYSTEM_USERNAME="${SYSTEM_USERNAME:-${NAMESPACE}plex}"
+# SYSTEM_GROUPNAME derived from NAMESPACE, not from USERNAME
+export SYSTEM_GROUPNAME="${SYSTEM_GROUPNAME:-${NAMESPACE}}"
+# UID comes from variables.env/BWS; must be set there
+export SYSTEM_USER_UID="${SYSTEM_USER_UID:-1114}"
+# GID always tracks UID
+export SYSTEM_GROUP_GID="${SYSTEM_GROUP_GID:-${SYSTEM_USER_UID}}"
+
+# ── 6. Early TMPDIR export (derived, never hardcoded) ───────────────
+TMPDIR="${NAMESPACE_ROOT_DIR}/tmp"
+export TMPDIR
+if [[ -d "$TMPDIR" ]]; then
+  echo "⚡ Using RAM Disk at $TMPDIR"
 fi
 
 # ── Banner ────────────────────────────────────────────────────────────
@@ -68,7 +95,8 @@ echo "╠═══════════════════════�
 echo "║  NAMESPACE:  ${NAMESPACE}"
 echo "║  ROOT:       ${NAMESPACE_ROOT_DIR}"
 echo "║  USER:       ${SYSTEM_USERNAME} (${SYSTEM_USER_UID}:${SYSTEM_GROUP_GID})"
-echo "║  TMPDIR:     ${TMPDIR:-/tmp}"
+echo "║  GROUP:      ${SYSTEM_GROUPNAME}"
+echo "║  TMPDIR:     ${TMPDIR}"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
 
