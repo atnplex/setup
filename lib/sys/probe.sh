@@ -1,20 +1,17 @@
 #!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # sys/probe.sh — Environment detection and dependency verification
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 [[ -n "${_STDLIB_MOD_PROBE:-}" ]] && return 0
 readonly _STDLIB_MOD_PROBE=1
 _STDLIB_MOD_VERSION="1.0.0"
 
 stdlib::import core/log
 
-# ── Run full environment probe ───────────────────────────────────────
-stdlib::probe::run() {
+# ── Detect OS ─────────────────────────────────────────────────────────────────
+stdlib::probe::detect_os() {
   PROBE_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
   export PROBE_OS
-
-  PROBE_ARCH="$(uname -m)"
-  export PROBE_ARCH
 
   PROBE_DISTRO="unknown"
   PROBE_DISTRO_VERSION="unknown"
@@ -27,8 +24,21 @@ stdlib::probe::run() {
   fi
   export PROBE_DISTRO PROBE_DISTRO_VERSION
 
+  stdlib::log::info "OS: ${PROBE_OS} | Distro: ${PROBE_DISTRO} ${PROBE_DISTRO_VERSION}"
+}
+
+# ── Detect architecture ───────────────────────────────────────────────────────
+stdlib::probe::detect_arch() {
+  PROBE_ARCH="$(uname -m)"
+  export PROBE_ARCH
+  stdlib::log::info "Arch: ${PROBE_ARCH}"
+}
+
+# ── Detect virtualization / container ─────────────────────────────────────────
+stdlib::probe::detect_virt() {
   PROBE_VIRT="none"
   PROBE_CONTAINER="false"
+
   if [[ -f /.dockerenv ]] || grep -qF docker /proc/1/cgroup 2>/dev/null; then
     PROBE_CONTAINER="true"
     PROBE_VIRT="docker"
@@ -45,17 +55,16 @@ stdlib::probe::run() {
   fi
   export PROBE_VIRT PROBE_CONTAINER
 
-  stdlib::log::info "OS: ${PROBE_OS} | Arch: ${PROBE_ARCH} | Distro: ${PROBE_DISTRO} ${PROBE_DISTRO_VERSION}"
   stdlib::log::info "Virt: ${PROBE_VIRT} | Container: ${PROBE_CONTAINER}"
 }
 
-# ── Check if a command exists ────────────────────────────────────────
+# ── Check if a command exists ─────────────────────────────────────────────────
 stdlib::probe::check_command() {
   command -v "${1:?command name required}" >/dev/null 2>&1
 }
 
-# ── Install required system dependencies ─────────────────────────────
-stdlib::probe::deps() {
+# ── Check and install required dependencies ───────────────────────────────────
+stdlib::probe::check_deps() {
   local -a required=(docker tailscale gh jq rsync)
   local -a missing=()
 
@@ -85,7 +94,7 @@ stdlib::probe::deps() {
   done
 }
 
-# ── Internal installers ──────────────────────────────────────────────
+# ── Internal installers ───────────────────────────────────────────────────────
 _probe_install_docker() {
   if stdlib::probe::check_command docker; then return 0; fi
   stdlib::log::info "Installing Docker..."

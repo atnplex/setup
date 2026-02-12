@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # sys/service.sh — Service and systemd setup layer
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 [[ -n "${_STDLIB_MOD_SERVICE:-}" ]] && return 0
 readonly _STDLIB_MOD_SERVICE=1
 _STDLIB_MOD_VERSION="1.0.0"
@@ -9,8 +9,8 @@ _STDLIB_MOD_VERSION="1.0.0"
 stdlib::import core/log
 stdlib::import sys/probe
 
-# ── Orchestrate all service setup ────────────────────────────────────
-stdlib::service::setup() {
+# ── Orchestrate all service setup ─────────────────────────────────────────────
+stdlib::service::ensure_services() {
   stdlib::service::apt_update
   stdlib::service::ensure_cloudflared
   stdlib::service::ensure_tailscale
@@ -18,7 +18,7 @@ stdlib::service::setup() {
   stdlib::service::ensure_dns
 }
 
-# ── apt update + upgrade ─────────────────────────────────────────────
+# ── apt update + upgrade ──────────────────────────────────────────────────────
 stdlib::service::apt_update() {
   stdlib::log::info "Updating system packages..."
   apt-get update -qq >/dev/null 2>&1
@@ -26,7 +26,7 @@ stdlib::service::apt_update() {
   stdlib::log::info "System packages updated"
 }
 
-# ── Cloudflared tunnel ───────────────────────────────────────────────
+# ── Cloudflared tunnel ────────────────────────────────────────────────────────
 stdlib::service::ensure_cloudflared() {
   if ! stdlib::probe::check_command cloudflared; then
     stdlib::log::info "Installing cloudflared..."
@@ -39,7 +39,7 @@ stdlib::service::ensure_cloudflared() {
     rm -f "${tmp_deb}"
   fi
 
-  # Configure tunnel if token available
+  # Configure tunnel if token available via keyctl or env
   local cf_token=""
   if command -v keyctl >/dev/null 2>&1; then
     cf_token="$(keyctl print "$(keyctl search @s user 'bootstrap:CF_TUNNEL_TOKEN' 2>/dev/null)" 2>/dev/null)" || true
@@ -55,10 +55,10 @@ stdlib::service::ensure_cloudflared() {
   fi
 }
 
-# ── Tailscale ────────────────────────────────────────────────────────
+# ── Tailscale ─────────────────────────────────────────────────────────────────
 stdlib::service::ensure_tailscale() {
   if ! stdlib::probe::check_command tailscale; then
-    stdlib::log::warn "Tailscale not installed — install via probe::deps first"
+    stdlib::log::warn "Tailscale not installed — install via probe::check_deps first"
     return 0
   fi
 
@@ -78,7 +78,7 @@ stdlib::service::ensure_tailscale() {
   fi
 }
 
-# ── Caddy ────────────────────────────────────────────────────────────
+# ── Caddy ─────────────────────────────────────────────────────────────────────
 stdlib::service::ensure_caddy() {
   if ! stdlib::probe::check_command caddy; then
     stdlib::log::info "Installing Caddy..."
@@ -93,7 +93,7 @@ stdlib::service::ensure_caddy() {
   stdlib::log::info "Caddy configured"
 }
 
-# ── DNS resolver ─────────────────────────────────────────────────────
+# ── DNS resolver ──────────────────────────────────────────────────────────────
 stdlib::service::ensure_dns() {
   if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
     if stdlib::probe::check_command tailscale; then

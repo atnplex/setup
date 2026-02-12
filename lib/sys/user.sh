@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # sys/user.sh — Identity enforcement (user, group, UID, GID)
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 [[ -n "${_STDLIB_MOD_USER:-}" ]] && return 0
 readonly _STDLIB_MOD_USER=1
 _STDLIB_MOD_VERSION="1.0.0"
 
 stdlib::import core/log
 
-# ── Enforce user and group with correct UID/GID ──────────────────────
-stdlib::user::enforce() {
+# ── Ensure user and group exist with correct UID/GID ──────────────────────────
+stdlib::user::ensure_identity() {
   local user="${BOOTSTRAP_USER:?BOOTSTRAP_USER not set}"
   local group="${BOOTSTRAP_GROUP:?BOOTSTRAP_GROUP not set}"
   local uid="${BOOTSTRAP_UID:?BOOTSTRAP_UID not set}"
@@ -56,11 +56,11 @@ stdlib::user::enforce() {
     usermod -aG docker "${user}" 2>/dev/null || true
   fi
 
-  stdlib::user::verify
+  stdlib::user::verify_identity
 }
 
-# ── Verify identity matches expected values ──────────────────────────
-stdlib::user::verify() {
+# ── Verify identity matches expected values ───────────────────────────────────
+stdlib::user::verify_identity() {
   local user="${BOOTSTRAP_USER:?BOOTSTRAP_USER not set}"
   local uid="${BOOTSTRAP_UID:?BOOTSTRAP_UID not set}"
   local gid="${BOOTSTRAP_GID:?BOOTSTRAP_GID not set}"

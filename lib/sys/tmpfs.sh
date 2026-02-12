@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # sys/tmpfs.sh — Tmpfs detection, workspace creation, and mount management
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 [[ -n "${_STDLIB_MOD_TMPFS:-}" ]] && return 0
 readonly _STDLIB_MOD_TMPFS=1
 _STDLIB_MOD_VERSION="1.0.0"
 
 stdlib::import core/log
 
-# ── Detect tmpfs mount candidates ────────────────────────────────────
+# ── Detect tmpfs mount candidates ─────────────────────────────────────────────
+# Populates _TMPFS_CANDIDATES array with mountpoint:size_kb entries
 stdlib::tmpfs::detect_candidates() {
   _TMPFS_CANDIDATES=()
 
@@ -25,12 +26,13 @@ stdlib::tmpfs::detect_candidates() {
       _TMPFS_CANDIDATES+=("${mp}:${size_kb:-0}")
     fi
   done < /proc/mounts
+
+  stdlib::log::info "Found ${#_TMPFS_CANDIDATES[@]} tmpfs candidates"
 }
 
-# ── Select the best (largest available) tmpfs ────────────────────────
+# ── Select the best (largest available) tmpfs ─────────────────────────────────
+# Sets _BEST_TMPFS to the mount point with most free space
 stdlib::tmpfs::select_best() {
-  stdlib::tmpfs::detect_candidates
-
   if [[ ${#_TMPFS_CANDIDATES[@]} -eq 0 ]]; then
     stdlib::log::warn "No writable tmpfs found — falling back to /tmp"
     _BEST_TMPFS="/tmp"
@@ -53,11 +55,10 @@ stdlib::tmpfs::select_best() {
   stdlib::log::info "Selected tmpfs: ${_BEST_TMPFS} (${best_size}KB free)"
 }
 
-# ── Create workspace on tmpfs + register cleanup trap ────────────────
+# ── Create workspace on tmpfs + register cleanup trap ─────────────────────────
+# Exports TMP_DIR, registers EXIT trap for cleanup
 stdlib::tmpfs::create_workspace() {
-  stdlib::tmpfs::select_best
-
-  TMP_DIR="$(mktemp -d "${_BEST_TMPFS}/bootstrap-XXXXXX")"
+  TMP_DIR="$(mktemp -d "${_BEST_TMPFS:-/tmp}/bootstrap-XXXXXX")"
   export TMP_DIR
 
   # shellcheck disable=SC2064
@@ -66,7 +67,8 @@ stdlib::tmpfs::create_workspace() {
   stdlib::log::info "Workspace: ${TMP_DIR}"
 }
 
-# ── Ensure permanent tmpfs mounts (fstab + mount) ────────────────────
+# ── Ensure permanent tmpfs mounts (fstab + mount) ─────────────────────────────
+# Manages $NAMESPACE_ROOT/tmp and $NAMESPACE_ROOT/logs
 stdlib::tmpfs::ensure_mounts() {
   local ns_root="${NAMESPACE_ROOT:?NAMESPACE_ROOT not set}"
 
@@ -74,7 +76,7 @@ stdlib::tmpfs::ensure_mounts() {
   _tmpfs_ensure_mount "${ns_root}/logs" "1G"  "0775"
 }
 
-# ── Internal: ensure a single tmpfs mount ────────────────────────────
+# ── Internal: ensure a single tmpfs mount ─────────────────────────────────────
 _tmpfs_ensure_mount() {
   local mount_point="$1"
   local size="$2"
@@ -118,7 +120,7 @@ _tmpfs_ensure_mount() {
   chmod "${mode}" "${mount_point}"
 }
 
-# ── Internal: parse size string to KB ────────────────────────────────
+# ── Internal: parse size string to KB ─────────────────────────────────────────
 _tmpfs_parse_size() {
   local size="$1"
   case "${size}" in
