@@ -152,7 +152,7 @@ stdlib::tmpfs::ensure_mount() {
   size_mb="$(stdlib::tmpfs::_parse_size "$size_spec")"
 
   # Build options string
-  local opts="defaults,noatime,nosuid,nodev,noexec,mode=${mode}"
+  local opts="defaults,noatime,nosuid,nodev,mode=${mode}"
   if [[ -n "$size_mb" ]]; then
     opts+=",size=${size_mb}m"
   fi
