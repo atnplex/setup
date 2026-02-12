@@ -1,91 +1,139 @@
 #!/usr/bin/env bash
 # Module: fs/file
-# Version: 0.1.0
-# Requires: (none)
-# Provides: stdlib::file::read, ::write, ::atomic_write, ::lock, ::unlock, ::checksum
-# Description: File I/O with atomic writes, locking, and checksums.
+# Version: 0.2.0
+# Provides: File I/O, atomic writes, locking, checksums, templating, backup
+# Requires: none
+[[ -n "${_STDLIB_FILE:-}" ]] && return 0
+declare -g _STDLIB_FILE=1
 
-[[ -n "${_STDLIB_LOADED_FS_FILE:-}" ]] && return 0
-readonly _STDLIB_LOADED_FS_FILE=1
-readonly _STDLIB_MOD_VERSION="0.1.0"
-
-# ---------- stdlib::file::read -----------------------------------------------
-# Read entire file content into a variable via nameref.
-# Usage: stdlib::file::read content_var /path/to/file
+# ── stdlib::file::read ────────────────────────────────────────
+# Read entire file content to stdout.
 stdlib::file::read() {
-  local -n _content="$1"
-  local filepath="${2:?filepath required}"
-  [[ -f "$filepath" ]] || { printf 'stdlib::file::read: not a file: %s\n' "$filepath" >&2; return 1; }
-  _content="$(< "$filepath")"
+  [[ -f "$1" ]] || { echo "ERROR: File not found: $1" >&2; return 1; }
+  cat "$1"
 }
 
-# ---------- stdlib::file::write ----------------------------------------------
-# Write content to a file (truncate).
-# Usage: stdlib::file::write /path/to/file "content"
+# ── stdlib::file::write ───────────────────────────────────────
+# Write content to a file (overwrite).
+# Usage: stdlib::file::write path content
 stdlib::file::write() {
-  local filepath="${1:?filepath required}" content="${2:-}"
-  printf '%s' "$content" > "$filepath"
-}
-
-# ---------- stdlib::file::atomic_write ---------------------------------------
-# Write to a temp file then atomically rename into place.
-stdlib::file::atomic_write() {
-  local filepath="${1:?filepath required}" content="${2:-}"
+  local path="$1" content="$2"
   local dir
-  dir="$(dirname "$filepath")"
-  local tmp
-  tmp="$(mktemp "${dir}/.stdlib_atomic.XXXXXXXXXX")"
-  printf '%s' "$content" > "$tmp"
-  mv -f "$tmp" "$filepath"
+  dir=$(dirname "$path")
+  [[ -d "$dir" ]] || mkdir -p "$dir"
+  printf '%s' "$content" > "$path"
 }
 
-# ---------- stdlib::file::lock -----------------------------------------------
-# Acquire an exclusive flock on a file. Returns the FD for later unlock.
-# Usage: stdlib::file::lock fd_var /path/to/lockfile [timeout_seconds]
+# ── stdlib::file::atomic_write ────────────────────────────────
+# Atomic write via temp file + mv (crash-safe).
+stdlib::file::atomic_write() {
+  local path="$1" content="$2"
+  local dir
+  dir=$(dirname "$path")
+  [[ -d "$dir" ]] || mkdir -p "$dir"
+
+  local tmpfile
+  tmpfile=$(mktemp "${dir}/.tmp.XXXXXX")
+  printf '%s' "$content" > "$tmpfile"
+  mv -f "$tmpfile" "$path"
+}
+
+# ── stdlib::file::lock ────────────────────────────────────────
+# Acquire an advisory lock on a file.
+# Usage: stdlib::file::lock lockfile [timeout_s]
 stdlib::file::lock() {
-  local -n _fd="$1"
-  local lockfile="${2:?lockfile required}"
-  local timeout="${3:-10}"
+  local lockfile="$1"
+  local timeout="${2:-10}"
 
-  exec {_fd}>"$lockfile"
-  if ! flock -w "$timeout" "$_fd"; then
-    printf 'stdlib::file::lock: timeout acquiring lock on %s\n' "$lockfile" >&2
-    exec {_fd}>&-
+  exec 9>"$lockfile"
+  if ! flock -w "$timeout" 9; then
+    echo "ERROR: Cannot acquire lock: $lockfile" >&2
     return 1
   fi
 }
 
-# ---------- stdlib::file::unlock ---------------------------------------------
-# Release a previously acquired flock.
-# Usage: stdlib::file::unlock fd_var
+# ── stdlib::file::unlock ──────────────────────────────────────
 stdlib::file::unlock() {
-  local -n _fd="$1"
-  flock -u "$_fd" 2>/dev/null
-  exec {_fd}>&-
+  exec 9>&-
 }
 
-# ---------- stdlib::file::checksum -------------------------------------------
-# Compute SHA-256 checksum of a file. Prints hex digest to stdout.
+# ── stdlib::file::checksum ────────────────────────────────────
+# SHA-256 checksum of a file.
 stdlib::file::checksum() {
-  local filepath="${1:?filepath required}"
-  [[ -f "$filepath" ]] || { printf 'stdlib::file::checksum: not a file: %s\n' "$filepath" >&2; return 1; }
-  if command -v sha256sum &>/dev/null; then
-    sha256sum "$filepath" | cut -d' ' -f1
-  elif command -v shasum &>/dev/null; then
-    shasum -a 256 "$filepath" | cut -d' ' -f1
-  else
-    printf 'stdlib::file::checksum: no SHA-256 tool found\n' >&2
-    return 1
-  fi
+  [[ -f "$1" ]] || return 1
+  sha256sum "$1" | awk '{print $1}'
 }
 
-# ---------- stdlib::file::size -----------------------------------------------
-# Print file size in bytes.
+# ── stdlib::file::size ────────────────────────────────────────
+# File size in bytes.
 stdlib::file::size() {
-  local filepath="${1:?filepath required}"
-  if stat --version &>/dev/null 2>&1; then
-    stat -c '%s' "$filepath"   # GNU stat
-  else
-    stat -f '%z' "$filepath"   # BSD stat
+  [[ -f "$1" ]] || { echo "0"; return 1; }
+  stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null
+}
+
+# ══════════════════════════════════════════════════════════════
+# NEW FUNCTIONS (v0.2.0)
+# ══════════════════════════════════════════════════════════════
+
+# ── stdlib::file::template ────────────────────────────────────
+# Render a template file with variable substitution.
+# Variables in the template use {{VAR_NAME}} syntax.
+# Usage: stdlib::file::template src dest "KEY1=val1" "KEY2=val2"...
+stdlib::file::template() {
+  local src="$1" dest="$2"; shift 2
+  [[ -f "$src" ]] || { echo "ERROR: Template not found: $src" >&2; return 1; }
+
+  local content
+  content=$(cat "$src")
+
+  local pair key val
+  for pair in "$@"; do
+    key="${pair%%=*}"
+    val="${pair#*=}"
+    content="${content//\{\{${key}\}\}/${val}}"
+  done
+
+  stdlib::file::atomic_write "$dest" "$content"
+}
+
+# ── stdlib::file::append ──────────────────────────────────────
+# Append content to a file (creates if not exists).
+stdlib::file::append() {
+  local path="$1" content="$2"
+  local dir
+  dir=$(dirname "$path")
+  [[ -d "$dir" ]] || mkdir -p "$dir"
+  printf '%s\n' "$content" >> "$path"
+}
+
+# ── stdlib::file::ensure_line ─────────────────────────────────
+# Add a line to a file if it's not already present (idempotent).
+# Usage: stdlib::file::ensure_line path "line content"
+stdlib::file::ensure_line() {
+  local path="$1" line="$2"
+
+  if [[ -f "$path" ]]; then
+    grep -qF "$line" "$path" && return 0
   fi
+
+  local dir
+  dir=$(dirname "$path")
+  [[ -d "$dir" ]] || mkdir -p "$dir"
+  printf '%s\n' "$line" >> "$path"
+}
+
+# ── stdlib::file::backup ──────────────────────────────────────
+# Create a backup of a file before modification.
+# Usage: stdlib::file::backup path [suffix]
+# Default suffix is .bak.YYYYMMDD-HHMMSS
+stdlib::file::backup() {
+  local path="$1"
+  local suffix="${2:-}"
+  [[ -f "$path" ]] || return 0  # Nothing to back up
+
+  if [[ -z "$suffix" ]]; then
+    suffix=".bak.$(date -u +%Y%m%d-%H%M%S)"
+  fi
+
+  cp -a "$path" "${path}${suffix}"
 }
