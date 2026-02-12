@@ -9,7 +9,7 @@
 # ║    4. stdlib sourcing                                             ║
 # ║    5. Delegation to stdlib::run::bootstrap_main                   ║
 # ║                                                                   ║
-# ║  All business logic lives in tmp/lib/core/run.sh                  ║
+# ║  All business logic lives in lib/core/run.sh                      ║
 # ╚═══════════════════════════════════════════════════════════════════╝
 set -euo pipefail
 
@@ -29,14 +29,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ── Locate or clone stdlib ───────────────────────────────────────────
 find_stdlib() {
   # 1. Relative to script (running from repo checkout)
-  if [[ -f "${SCRIPT_DIR}/tmp/lib/stdlib.sh" ]]; then
-    echo "${SCRIPT_DIR}/tmp/lib"
+  if [[ -f "${SCRIPT_DIR}/lib/stdlib.sh" ]]; then
+    echo "${SCRIPT_DIR}/lib"
     return 0
   fi
 
   # 2. Parent directory (script in sub-folder)
-  if [[ -f "${SCRIPT_DIR}/../tmp/lib/stdlib.sh" ]]; then
-    (cd "${SCRIPT_DIR}/../tmp/lib" && pwd)
+  if [[ -f "${SCRIPT_DIR}/../lib/stdlib.sh" ]]; then
+    (cd "${SCRIPT_DIR}/../lib" && pwd)
     return 0
   fi
 
@@ -45,7 +45,7 @@ find_stdlib() {
   clone_dir="$(mktemp -d "${TMPDIR:-/tmp}/setup-XXXXXX")"
   echo "Cloning setup repo into ${clone_dir}..." >&2
   git clone --depth 1 --branch "${SETUP_BRANCH}" "${SETUP_REPO}" "${clone_dir}" 2>&1 | tail -1 >&2
-  echo "${clone_dir}/tmp/lib"
+  echo "${clone_dir}/lib"
 }
 
 STDLIB_ROOT="$(find_stdlib)"
@@ -58,7 +58,7 @@ if [[ ! -f "${STDLIB_ROOT}/stdlib.sh" ]]; then
 fi
 
 # ── Source stdlib + import orchestrator ────────────────────────────────
-# shellcheck source=tmp/lib/stdlib.sh
+# shellcheck source=lib/stdlib.sh
 source "${STDLIB_ROOT}/stdlib.sh"
 stdlib::import core/run
 

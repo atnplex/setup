@@ -1,83 +1,97 @@
-# ATN Server Setup
+# setup
 
-Universal bootstrap for ATN infrastructure servers. One repo to set up any Debian server with everything needed: Docker, Tailscale, Cloudflared, GitHub CLI, MCP servers, and the full Antigravity agent configuration.
+Modular server bootstrap — thin entrypoint, stdlib-based orchestrator, zero hard-coded values.
 
 ## Quick Start
 
 ```bash
-# Clone and run all modules
-git clone https://github.com/atnplex/setup.git /atn/github/setup
-cd /atn/github/setup
-
-# Option 1: Run the all-in-one bootstrap (installs everything)
-./bootstrap.sh
-
-# Option 2: Run the modular system (ordered modules)
-source lib/core.sh
-source lib/registry.sh
-detect_os
-parse_args "$@"
-registry_init modules
-# Then run individual or all modules
+bash <(curl -fsSL https://raw.githubusercontent.com/atnplex/setup/modular/bootstrap.sh)
 ```
 
-## Modules (execution order)
-
-| Order | Module | Description |
-|-------|--------|-------------|
-| 10 | `ssh` | Configure SSH server and client |
-| 20 | `users-groups` | Create users and set permissions |
-| 30 | `tailscale` | Install Tailscale mesh VPN |
-| 40 | `cloudflared` | Install Cloudflare Tunnel |
-| 50 | `docker` | Install Docker Engine + Compose |
-| 60 | `github-cli` | Install `gh` CLI + authenticate |
-| 70 | `agent-config` | **Deploy AG rules, skills, workflows, settings** |
-| 80 | `mcp-servers` | Pull MCP Docker images |
-
-## Config Directory
-
-The `config/` directory contains the portable, version-controlled agent configuration:
-
-```
-config/
-├── agent/
-│   ├── rules/          # 60+ operational, format, and security rules
-│   └── learning/       # Learning patterns and reflections
-├── gemini/
-│   ├── GEMINI.md       # Global rules entry point
-│   ├── mcp_config.json # MCP server configuration
-│   ├── skills/         # 22 skills with SKILL.md + scripts
-│   ├── global_workflows/  # 19 workflows (/triage, /resume, etc.)
-│   └── personas/       # 13 persona definitions
-├── baseline/           # Baseline rules (format, execution, governance)
-└── vscode/
-    └── machine-settings.json  # Auto-approve and editor settings
-```
-
-### What's NOT in this repo (sync separately)
-
-| Data | Size | Sync method |
-|------|------|-------------|
-| Brain/conversations | ~180MB | Syncthing or cloud drive |
-| Scratch state (session_log, todo) | ~30MB | Syncthing |
-| VS Code server binaries | ~2.5GB | Auto-downloaded on first connect |
-| Appdata (service volumes) | varies | Per-service backup |
-
-## Servers
-
-| Server | Tailscale IP | Role |
-|--------|-------------|------|
-| VPS1 (vps) | 100.67.88.109 | HA secondary |
-| VPS2 (condo) | 100.102.55.88 | HA primary |
-| Unraid | 100.76.168.116 | Media services |
-| Debian VM | 100.74.111.60 | Development/testing |
-
-## Environment Variables
-
-Set these before running for non-interactive setup:
+Or with pre-set tokens (no interactive prompts):
 
 ```bash
-export GITHUB_PERSONAL_ACCESS_TOKEN="ghp_..."
-export CLOUDFLARED_TOKEN="eyJ..."       # Cloudflare tunnel token
-export NAMESPACE="/atn"             # Default: /atn
+export BWS_ACCESS_TOKEN=... BOOTSTRAP_USER=myuser BOOTSTRAP_UID=1114
+bash <(curl -fsSL https://raw.githubusercontent.com/atnplex/setup/modular/bootstrap.sh) --dry-run
 ```
+
+## Architecture
+
+```
+bootstrap.sh              → 66-line thin entrypoint
+  └─ lib/stdlib.sh        → module loader (lazy import, once-only)
+       └─ lib/core/run.sh → 8-phase orchestrator
+            ├─ core/config.sh        variables discovery & loading
+            ├─ sys/os.sh             OS/arch/RAM detection
+            ├─ sys/user.sh           user/group/UID/GID enforcement
+            ├─ sys/tmpfs.sh          tmpfs detection + TMP_DIR contract
+            ├─ sys/fstab.sh          fstab entry management
+            ├─ sys/secrets.sh        4-tier secrets (env → keyctl → age → BWS)
+            ├─ sys/hostname.sh       hostname management
+            ├─ sys/deps.sh           package dependency management
+            ├─ sys/service.sh        systemd service management
+            ├─ sys/docker_install.sh idempotent Docker CE install
+            ├─ sys/tailscale_install.sh idempotent Tailscale install
+            └─ fs/layout.sh          namespace dirs + symlinks
+```
+
+## Variables
+
+All values are sourced from `defaults.env`, environment, or CLI flags. Nothing is hard-coded.
+
+### Core Identity
+
+| Variable          | Default           | Description                   |
+| ----------------- | ----------------- | ----------------------------- |
+| `NAMESPACE`       | `/atn`            | Root namespace path           |
+| `NAMESPACE_ROOT`  | `$NAMESPACE`      | Alias used by stdlib modules  |
+| `BOOTSTRAP_USER`  | (required)        | System user to create/enforce |
+| `BOOTSTRAP_GROUP` | `$BOOTSTRAP_USER` | System group                  |
+| `BOOTSTRAP_UID`   | (required)        | Desired UID                   |
+| `BOOTSTRAP_GID`   | `$BOOTSTRAP_UID`  | Desired GID                   |
+
+### Infrastructure
+
+| Variable         | Default                                | Description                |
+| ---------------- | -------------------------------------- | -------------------------- |
+| `GH_ORG`         | `atnplex`                              | GitHub organization        |
+| `DOCKER_NETWORK` | `atn_bridge`                           | Docker bridge network name |
+| `SETUP_REPO`     | `https://github.com/atnplex/setup.git` | Bootstrap repo URL         |
+| `SETUP_BRANCH`   | `modular`                              | Branch to clone            |
+| `SETUP_REPO_DIR` | `$NAMESPACE/github/setup`              | Local repo clone path      |
+
+### Config & Secrets
+
+| Variable             | Default             | Description                     |
+| -------------------- | ------------------- | ------------------------------- |
+| `VARIABLES_FILE`     | auto-discovered     | Path to `variables.env` file    |
+| `VARIABLES_FILE_CLI` | (none)              | Override via `--vars-file` flag |
+| `SECRETS_FILE`       | auto-discovered     | Path to encrypted `.age` file   |
+| `BWS_ACCESS_TOKEN`   | (env/keyctl)        | Bitwarden Secrets Manager token |
+| `GH_TOKEN`           | (env/keyctl)        | GitHub personal access token    |
+| `TMP_DIR`            | auto-detected tmpfs | Trap-cleaned volatile workspace |
+
+### Runtime Flags
+
+| Variable        | Default | Description                         |
+| --------------- | ------- | ----------------------------------- |
+| `DRY_RUN`       | `false` | Print commands instead of executing |
+| `SKIP_SERVICES` | `false` | Skip Docker/Tailscale install phase |
+| `INTERACTIVE`   | auto    | Enable/disable interactive prompts  |
+
+## Module Library
+
+The `lib/` directory contains a complete Bash standard library:
+
+| Category | Modules                                                                                                                       | Purpose               |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------- |
+| `core/`  | assert, config, import, log, meta, run, strict, vars                                                                          | Foundation primitives |
+| `data/`  | args, array, config, datetime, hash, json, semver, string                                                                     | Data manipulation     |
+| `fs/`    | dir, file, find, layout, path                                                                                                 | Filesystem operations |
+| `sys/`   | deps, docker, docker_install, download, fstab, hostname, net, os, pkg, proc, secrets, service, tailscale_install, tmpfs, user | System management     |
+| `term/`  | ansi, menu, progress, prompt                                                                                                  | Terminal UI           |
+| `test/`  | mock, perf, tap                                                                                                               | Testing framework     |
+
+## License
+
+Private repository — all rights reserved.
