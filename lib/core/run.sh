@@ -4,7 +4,7 @@
 # Provides: Bootstrap orchestrator — the single entry point for system setup
 # Requires: core/config, sys/os, sys/user, sys/tmpfs, sys/fstab, sys/secrets,
 #           sys/deps, sys/docker_install, sys/tailscale_install, sys/service,
-#           sys/hostname, fs/layout
+#           sys/hostname, sys/locking, fs/layout
 [[ -n "${_STDLIB_RUN:-}" ]] && return 0
 declare -g _STDLIB_RUN=1
 
@@ -64,6 +64,7 @@ stdlib::run::bootstrap_main() {
   [[ "$dry_run" == "true" ]] && _run_warn "DRY-RUN mode — no destructive changes"
 
   # Import required stdlib modules
+  stdlib::import sys/locking
   stdlib::import core/config
   stdlib::import sys/os
   stdlib::import sys/user
@@ -76,6 +77,14 @@ stdlib::run::bootstrap_main() {
   stdlib::import sys/docker_install
   stdlib::import sys/tailscale_install
   stdlib::import fs/layout
+
+  # ── Acquire bootstrap lock (prevents concurrent runs) ──
+  local _lockfile="/tmp/.stdlib-bootstrap.lock"
+  if ! stdlib::lock::acquire "$_lockfile" 5; then
+    _run_err "Another bootstrap is running (lock: $_lockfile, owner: $(stdlib::lock::owner "$_lockfile"))"
+    return 1
+  fi
+  _run_ok "Lock acquired: $_lockfile (PID $$)"
 
   # ── Phase 0: Tmpfs workspace ──
   _run_log "Phase 0: Creating tmpfs workspace..."
@@ -120,6 +129,9 @@ stdlib::run::bootstrap_main() {
   # ── Phase 8: Seed variables file ──
   _run_log "Phase 8: Seeding variables file..."
   stdlib::config::seed_file
+
+  # ── Release bootstrap lock ──
+  stdlib::lock::release "$_lockfile"
 
   # ── Summary ──
   stdlib::run::print_summary
