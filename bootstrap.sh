@@ -19,10 +19,6 @@ if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
   exit 1
 fi
 
-# ── Constants ─────────────────────────────────────────────────────────
-readonly SETUP_REPO="${SETUP_REPO:-https://github.com/atnplex/setup.git}"
-readonly SETUP_BRANCH="${SETUP_BRANCH:-modular}"
-
 # ── Resolve script location ──────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -44,7 +40,9 @@ find_stdlib() {
   local clone_dir
   clone_dir="$(mktemp -d "${TMPDIR:-/tmp}/setup-XXXXXX")"
   echo "Cloning setup repo into ${clone_dir}..." >&2
-  git clone --depth 1 --branch "${SETUP_BRANCH}" "${SETUP_REPO}" "${clone_dir}" 2>&1 | tail -1 >&2
+  git clone --depth 1 --branch modular \
+    "https://github.com/${GH_ORG:-atnplex}/setup.git" \
+    "${clone_dir}" 2>&1 | tail -1 >&2
   echo "${clone_dir}/lib"
 }
 
