@@ -7,7 +7,7 @@
 declare -g _STDLIB_SECRETS=1
 
 # ── Internal State ─────────────────────────────────────────────────────
-declare -g _SECRETS_DIR="${SECRETS_DIR:-${NAMESPACE_ROOT:+${NAMESPACE_ROOT}/.ignore/secrets}}"
+declare -g _SECRETS_DIR="${SECRETS_DIR:-${NAMESPACE_ROOT_DIR:+${NAMESPACE_ROOT_DIR}/.ignore/secrets}}"
 _SECRETS_DIR="${_SECRETS_DIR:-/tmp/secrets}" # Absolute fallback
 declare -g _SECRETS_AGE_FILE="${_SECRETS_DIR}/secrets.age"
 declare -g _SECRETS_AGE_KEY="${_SECRETS_DIR}/age.key"

@@ -18,7 +18,7 @@ stdlib::tmpfs::detect_candidates() {
 
 # ── stdlib::tmpfs::select_best ────────────────────────────────────────
 # Choose the best tmpfs mount point for temporary workspace.
-# Priority: 1) $NAMESPACE_ROOT/tmp (if exists & tmpfs)
+# Priority: 1) $NAMESPACE_ROOT_DIR/tmp (if exists & tmpfs)
 #           2) /dev/shm
 #           3) /run
 #           4) /tmp

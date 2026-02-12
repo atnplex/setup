@@ -1,82 +1,122 @@
 #!/usr/bin/env bash
 # Module: core/config
-# Version: 0.1.0
-# Provides: Variables file discovery, loading, resolution, and seeding
-# Requires: none
+# Version: 0.2.0
+# Provides: Variables discovery, loading, resolution, seeding, BWS integration
+# Requires: core/sanitize (for no-eval loading)
 [[ -n "${_STDLIB_CONFIG:-}" ]] && return 0
 declare -g _STDLIB_CONFIG=1
 
-# ── stdlib::config::discover_file ─────────────────────────────────────
-# Locate the variables file using priority chain:
-#   1. $1 (explicit path, e.g. from CLI --variables-file)
-#   2. $VARIABLES_FILE environment variable
-#   3. $NAMESPACE_ROOT/.ignore/variables.env
-#   4. /etc/bootstrap/variables.env
-# Prints the first found path, or empty if none exist.
-stdlib::config::discover_file() {
-  local explicit="${1:-}"
+# ── stdlib::config::discover_files ────────────────────────────────────
+# Search the top 4 directory levels under NAMESPACE_ROOT_DIR for:
+#   variables.env, secrets.env, secrets.age
+# Populates global variables: VARIABLES_ENV_FILE, SECRETS_ENV_FILE,
+# ENCRYPTED_SECRETS_AGE_FILE
+# Conventional search paths (in priority order):
+#   1. .ignore/<filename>
+#   2. <filename> (at root)
+#   3. configs/<filename>
+stdlib::config::discover_files() {
+  local root="${NAMESPACE_ROOT_DIR:-}"
+  [[ -z "$root" ]] && return 1
 
-  # Priority 1: explicit path
-  if [[ -n "$explicit" && -f "$explicit" ]]; then
-    echo "$explicit"
-    return 0
+  local f
+
+  # ── variables.env ──
+  if [[ -z "${VARIABLES_ENV_FILE:-}" ]]; then
+    for f in \
+      "${root}/.ignore/variables.env" \
+      "${root}/variables.env" \
+      "${root}/configs/variables.env" \
+      "/etc/bootstrap/variables.env"; do
+      if [[ -f "$f" ]]; then
+        VARIABLES_ENV_FILE="$f"
+        break
+      fi
+    done
   fi
+  export VARIABLES_ENV_FILE="${VARIABLES_ENV_FILE:-}"
 
-  # Priority 2: environment variable
-  if [[ -n "${VARIABLES_FILE:-}" && -f "$VARIABLES_FILE" ]]; then
-    echo "$VARIABLES_FILE"
-    return 0
+  # ── secrets.env ──
+  if [[ -z "${SECRETS_ENV_FILE:-}" ]]; then
+    for f in \
+      "${root}/.ignore/secrets.env" \
+      "${root}/secrets.env" \
+      "${root}/configs/secrets.env"; do
+      if [[ -f "$f" ]]; then
+        SECRETS_ENV_FILE="$f"
+        break
+      fi
+    done
   fi
+  export SECRETS_ENV_FILE="${SECRETS_ENV_FILE:-}"
 
-  # Priority 3: conventional location
-  if [[ -n "${NAMESPACE_ROOT:-}" && -f "${NAMESPACE_ROOT}/.ignore/variables.env" ]]; then
-    echo "${NAMESPACE_ROOT}/.ignore/variables.env"
-    return 0
+  # ── secrets.age ──
+  if [[ -z "${ENCRYPTED_SECRETS_AGE_FILE:-}" ]]; then
+    for f in \
+      "${root}/.ignore/secrets.age" \
+      "${root}/secrets.age" \
+      "${root}/.ignore/secrets/secrets.age" \
+      "${root}/configs/secrets.age"; do
+      if [[ -f "$f" ]]; then
+        ENCRYPTED_SECRETS_AGE_FILE="$f"
+        break
+      fi
+    done
   fi
+  export ENCRYPTED_SECRETS_AGE_FILE="${ENCRYPTED_SECRETS_AGE_FILE:-}"
 
-  # Priority 4: system fallback
-  if [[ -f "/etc/bootstrap/variables.env" ]]; then
-    echo "/etc/bootstrap/variables.env"
-    return 0
-  fi
-
-  return 1
+  # ── global.conf ──
+  export GLOBAL_CONF_FILE="${GLOBAL_CONF_FILE:-${root}/configs/global.conf}"
 }
 
-# ── stdlib::config::load_file ─────────────────────────────────────────
-# Parse a KEY=VALUE file, exporting each variable.
-# Skips comments (#), blank lines, and does not override existing env vars.
-# Usage: stdlib::config::load_file path [override]
-#   If override=true, existing env vars ARE overwritten.
-stdlib::config::load_file() {
-  local filepath="$1"
-  local override="${2:-false}"
+# ── stdlib::config::load_chain ────────────────────────────────────────
+# Load the full configuration chain in precedence order (last wins):
+#   1. defaults.env (from repo)
+#   2. BWS project "variables" (if available)
+#   3. VARIABLES_ENV_FILE (discovered)
+#   4. SECRETS_ENV_FILE (discovered, sensitive)
+#   5. global.conf (user overrides — highest precedence)
+#
+# Uses stdlib::sanitize::load_file for no-eval, validated loading.
+stdlib::config::load_chain() {
+  local repo_dir="${1:-}"
 
-  [[ -f "$filepath" ]] || return 1
+  # Import sanitizer if available
+  if declare -F stdlib::import &>/dev/null; then
+    stdlib::import core/sanitize
+  fi
 
-  local key val
-  while IFS='=' read -r key val; do
-    # Skip comments and blanks
-    key="${key%%#*}"
-    key="$(echo "$key" | tr -d '[:space:]')"
-    [[ -z "$key" ]] && continue
+  local loader="stdlib::sanitize::load_file"
+  if ! declare -F "$loader" &>/dev/null; then
+    loader="stdlib::config::_basic_load"
+  fi
 
-    # Strip surrounding quotes from value
-    val="${val#\"}"
-    val="${val%\"}"
-    val="${val#\'}"
-    val="${val%\'}"
+  # 1. Repo defaults
+  if [[ -n "$repo_dir" && -f "${repo_dir}/defaults.env" ]]; then
+    "$loader" "${repo_dir}/defaults.env" false
+  fi
 
-    # Only set if not already in env (unless override)
-    if [[ "$override" == "true" ]] || [[ -z "${!key:-}" ]]; then
-      export "$key=$val"
-    fi
-  done <"$filepath"
+  # 2. BWS project "variables" (if available, writes to VARIABLES_ENV_FILE)
+  stdlib::config::load_from_bws 2>/dev/null || true
+
+  # 3. Discovered variables.env
+  if [[ -n "${VARIABLES_ENV_FILE:-}" && -f "${VARIABLES_ENV_FILE}" ]]; then
+    "$loader" "${VARIABLES_ENV_FILE}" true
+  fi
+
+  # 4. Discovered secrets.env
+  if [[ -n "${SECRETS_ENV_FILE:-}" && -f "${SECRETS_ENV_FILE}" ]]; then
+    "$loader" "${SECRETS_ENV_FILE}" true
+  fi
+
+  # 5. Global conf (highest precedence)
+  if [[ -n "${GLOBAL_CONF_FILE:-}" && -f "${GLOBAL_CONF_FILE}" ]]; then
+    "$loader" "${GLOBAL_CONF_FILE}" true
+  fi
 }
 
 # ── stdlib::config::resolve_vars ──────────────────────────────────────
-# Resolve all required bootstrap variables with fallback chain:
-#   env → variables file → derived defaults → interactive prompt
+# Resolve all required bootstrap variables with automatic derivation.
 # Usage: stdlib::config::resolve_vars [variables_file] [interactive]
 stdlib::config::resolve_vars() {
   local vfile="${1:-}"
@@ -84,66 +124,72 @@ stdlib::config::resolve_vars() {
 
   # Load variables file if provided and exists
   if [[ -n "$vfile" && -f "$vfile" ]]; then
-    stdlib::config::load_file "$vfile"
+    if declare -F stdlib::sanitize::load_file &>/dev/null; then
+      stdlib::sanitize::load_file "$vfile"
+    else
+      stdlib::config::_basic_load "$vfile"
+    fi
   fi
 
   # ── NAMESPACE (required) ──
   if [[ -z "${NAMESPACE:-}" ]]; then
     if [[ "$interactive" == "true" ]]; then
-      read -rp "  Namespace short name (e.g., atn): " NAMESPACE </dev/tty 2>/dev/null || true
+      read -rp "  Namespace name (e.g., atn): " NAMESPACE </dev/tty 2>/dev/null || true
     fi
     [[ -z "${NAMESPACE:-}" ]] && {
       echo "FATAL: NAMESPACE is required" >&2
       return 1
     }
   fi
+  # Normalize: lowercase, alphanumeric + underscore only
+  NAMESPACE="${NAMESPACE,,}"
   export NAMESPACE
 
-  # ── NAMESPACE_ROOT — derive from NAMESPACE if missing ──
-  NAMESPACE_ROOT="${NAMESPACE_ROOT:-/${NAMESPACE}}"
-  export NAMESPACE_ROOT
+  # ── NAMESPACE_ROOT_DIR — INTERNAL, auto-derived, never user-settable ──
+  NAMESPACE_ROOT_DIR="/${NAMESPACE}"
+  export NAMESPACE_ROOT_DIR
 
-  # ── BOOTSTRAP_USER — detect from current user ──
-  BOOTSTRAP_USER="${BOOTSTRAP_USER:-$(whoami 2>/dev/null || echo root)}"
-  export BOOTSTRAP_USER
-
-  # ── BOOTSTRAP_GROUP — derive from NAMESPACE ──
-  BOOTSTRAP_GROUP="${BOOTSTRAP_GROUP:-${NAMESPACE}}"
-  export BOOTSTRAP_GROUP
-
-  # ── BOOTSTRAP_UID — detect or prompt ──
-  if [[ -z "${BOOTSTRAP_UID:-}" ]]; then
-    local current_uid
-    current_uid="$(id -u "$BOOTSTRAP_USER" 2>/dev/null || true)"
-    if [[ -n "$current_uid" && "$current_uid" -ne 0 ]]; then
-      BOOTSTRAP_UID="$current_uid"
-    elif [[ "$interactive" == "true" ]]; then
-      read -rp "  UID for $BOOTSTRAP_USER: " BOOTSTRAP_UID </dev/tty 2>/dev/null || true
-    fi
-    [[ -z "${BOOTSTRAP_UID:-}" ]] && {
-      echo "FATAL: BOOTSTRAP_UID is required" >&2
-      return 1
-    }
-  fi
-  export BOOTSTRAP_UID
-
-  # ── BOOTSTRAP_GID — match UID by default ──
-  BOOTSTRAP_GID="${BOOTSTRAP_GID:-${BOOTSTRAP_UID}}"
-  export BOOTSTRAP_GID
-
-  # ── Optional variables with defaults ──
+  # ── GH_ORG — derived from NAMESPACE ──
   GH_ORG="${GH_ORG:-${NAMESPACE}plex}"
   export GH_ORG
 
-  DOCKER_NETWORK="${DOCKER_NETWORK:-${NAMESPACE}_net}"
+  # ── SYSTEM_USERNAME — defaults to GH_ORG ──
+  SYSTEM_USERNAME="${SYSTEM_USERNAME:-${GH_ORG}}"
+  export SYSTEM_USERNAME
+
+  # ── SYSTEM_GROUPNAME — defaults to SYSTEM_USERNAME ──
+  SYSTEM_GROUPNAME="${SYSTEM_GROUPNAME:-${SYSTEM_USERNAME}}"
+  export SYSTEM_GROUPNAME
+
+  # ── SYSTEM_USER_UID — default 1234 ──
+  if [[ -z "${SYSTEM_USER_UID:-}" ]]; then
+    local current_uid
+    current_uid="$(id -u "$SYSTEM_USERNAME" 2>/dev/null || true)"
+    if [[ -n "$current_uid" && "$current_uid" -ne 0 ]]; then
+      SYSTEM_USER_UID="$current_uid"
+    else
+      SYSTEM_USER_UID="1234"
+    fi
+  fi
+  export SYSTEM_USER_UID
+
+  # ── SYSTEM_GROUP_GID — defaults to SYSTEM_USER_UID ──
+  SYSTEM_GROUP_GID="${SYSTEM_GROUP_GID:-${SYSTEM_USER_UID}}"
+  export SYSTEM_GROUP_GID
+
+  # ── Auto-derived (internal, not user-facing) ──
+  DOCKER_NETWORK="${DOCKER_NETWORK:-${NAMESPACE}_bridge}"
   export DOCKER_NETWORK
 
-  # ── Derived paths ──
-  VARIABLES_FILE="${VARIABLES_FILE:-${NAMESPACE_ROOT}/.ignore/variables.env}"
-  export VARIABLES_FILE
+  # ── Discover config/secret file paths ──
+  stdlib::config::discover_files
 
-  SECRETS_FILE="${SECRETS_FILE:-${NAMESPACE_ROOT}/.ignore/secrets/secrets.age}"
-  export SECRETS_FILE
+  # Set defaults for file paths if not yet discovered
+  VARIABLES_ENV_FILE="${VARIABLES_ENV_FILE:-${NAMESPACE_ROOT_DIR}/.ignore/variables.env}"
+  export VARIABLES_ENV_FILE
+
+  ENCRYPTED_SECRETS_AGE_FILE="${ENCRYPTED_SECRETS_AGE_FILE:-${NAMESPACE_ROOT_DIR}/.ignore/secrets/secrets.age}"
+  export ENCRYPTED_SECRETS_AGE_FILE
 }
 
 # ── stdlib::config::seed_file ─────────────────────────────────────────
@@ -151,7 +197,7 @@ stdlib::config::resolve_vars() {
 # Idempotent: only writes if the file doesn't exist or is empty.
 # Usage: stdlib::config::seed_file [target_path]
 stdlib::config::seed_file() {
-  local target="${1:-${VARIABLES_FILE:-}}"
+  local target="${1:-${VARIABLES_ENV_FILE:-}}"
   [[ -z "$target" ]] && return 1
 
   # Don't overwrite existing populated file
@@ -167,17 +213,56 @@ stdlib::config::seed_file() {
 # Bootstrap Variables — Auto-generated $(date -u +%Y-%m-%dT%H:%M:%SZ)
 # Source of truth for non-secret environment values.
 NAMESPACE=${NAMESPACE:-}
-NAMESPACE_ROOT=${NAMESPACE_ROOT:-}
-BOOTSTRAP_USER=${BOOTSTRAP_USER:-}
-BOOTSTRAP_GROUP=${BOOTSTRAP_GROUP:-}
-BOOTSTRAP_UID=${BOOTSTRAP_UID:-}
-BOOTSTRAP_GID=${BOOTSTRAP_GID:-}
 GH_ORG=${GH_ORG:-}
+SYSTEM_USERNAME=${SYSTEM_USERNAME:-}
+SYSTEM_GROUPNAME=${SYSTEM_GROUPNAME:-}
+SYSTEM_USER_UID=${SYSTEM_USER_UID:-}
+SYSTEM_GROUP_GID=${SYSTEM_GROUP_GID:-}
 DOCKER_NETWORK=${DOCKER_NETWORK:-}
 SEED_EOF
 
-  sudo chown "${BOOTSTRAP_USER:-root}:${BOOTSTRAP_GROUP:-root}" "$target" 2>/dev/null || true
+  sudo chown "${SYSTEM_USERNAME:-root}:${SYSTEM_GROUPNAME:-root}" "$target" 2>/dev/null || true
   chmod 600 "$target" 2>/dev/null || true
+}
+
+# ── stdlib::config::ensure_global_conf ────────────────────────────────
+# Create global.conf if missing — all settings commented out.
+stdlib::config::ensure_global_conf() {
+  local target="${GLOBAL_CONF_FILE:-${NAMESPACE_ROOT_DIR:-}/configs/global.conf}"
+  [[ -f "$target" ]] && return 0
+
+  local parent
+  parent="$(dirname "$target")"
+  [[ -d "$parent" ]] || sudo mkdir -p "$parent"
+
+  cat >"$target" <<'CONF_EOF'
+# Global Configuration — User Overrides
+# Uncomment and modify any setting to override defaults.
+# This file is loaded LAST and has the HIGHEST precedence.
+#
+# ── Namespace ──
+# NAMESPACE=atn
+#
+# ── GitHub ──
+# GH_ORG=atnplex
+#
+# ── System Identity ──
+# SYSTEM_USERNAME=atnplex
+# SYSTEM_GROUPNAME=atnplex
+# SYSTEM_USER_UID=1234
+# SYSTEM_GROUP_GID=1234
+#
+# ── Docker ──
+# DOCKER_NETWORK=atn_bridge
+#
+# ── Runtime flags ──
+# DRY_RUN=false
+# SKIP_SERVICES=false
+# INTERACTIVE=true
+CONF_EOF
+
+  sudo chown "${SYSTEM_USERNAME:-root}:${SYSTEM_GROUPNAME:-root}" "$target" 2>/dev/null || true
+  chmod 644 "$target" 2>/dev/null || true
 }
 
 # ── stdlib::config::load_from_bws ─────────────────────────────────────
@@ -186,7 +271,7 @@ SEED_EOF
 # Requires: bws CLI + BWS_ACCESS_TOKEN
 # Usage: stdlib::config::load_from_bws [target_file]
 stdlib::config::load_from_bws() {
-  local target="${1:-${VARIABLES_FILE:-}}"
+  local target="${1:-${VARIABLES_ENV_FILE:-}}"
 
   command -v bws &>/dev/null || return 1
   [[ -n "${BWS_ACCESS_TOKEN:-}" ]] || return 1
@@ -203,7 +288,7 @@ stdlib::config::load_from_bws() {
   local secrets_json
   secrets_json="$(bws secret list --project-id "$project_id" 2>/dev/null)" || return 1
 
-  # Parse and export: each BWS secret key → variable name, value → variable value
+  # Parse and export
   local count=0 key val
   while IFS=$'\t' read -r key val; do
     [[ -z "$key" ]] && continue
@@ -225,9 +310,33 @@ stdlib::config::load_from_bws() {
       echo "$secrets_json" | jq -r '.[] | "\(.key)=\(.value)"' 2>/dev/null
     } >"$target"
 
-    sudo chown "${BOOTSTRAP_USER:-root}:${BOOTSTRAP_GROUP:-root}" "$target" 2>/dev/null || true
+    sudo chown "${SYSTEM_USERNAME:-root}:${SYSTEM_GROUPNAME:-root}" "$target" 2>/dev/null || true
     chmod 600 "$target" 2>/dev/null || true
   fi
 
   return 0
+}
+
+# ── Internal: basic loader (fallback if sanitize not available) ───────
+stdlib::config::_basic_load() {
+  local filepath="$1"
+  local override="${2:-false}"
+
+  [[ -f "$filepath" ]] || return 1
+
+  local key val
+  while IFS='=' read -r key val; do
+    key="${key%%#*}"
+    key="$(echo "$key" | tr -d '[:space:]')"
+    [[ -z "$key" ]] && continue
+
+    val="${val#\"}"
+    val="${val%\"}"
+    val="${val#\'}"
+    val="${val%\'}"
+
+    if [[ "$override" == "true" ]] || [[ -z "${!key:-}" ]]; then
+      export "$key=$val"
+    fi
+  done <"$filepath"
 }

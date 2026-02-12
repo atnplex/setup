@@ -2,9 +2,9 @@
 # Module: core/run
 # Version: 0.1.0
 # Provides: Bootstrap orchestrator — the single entry point for system setup
-# Requires: core/config, sys/os, sys/user, sys/tmpfs, sys/fstab, sys/secrets,
-#           sys/deps, sys/docker_install, sys/tailscale_install, sys/service,
-#           sys/hostname, sys/locking, fs/layout
+# Requires: core/config, core/sanitize, sys/os, sys/user, sys/tmpfs, sys/fstab,
+#           sys/secrets, sys/deps, sys/docker_install, sys/tailscale_install,
+#           sys/service, sys/hostname, sys/locking, fs/layout
 [[ -n "${_STDLIB_RUN:-}" ]] && return 0
 declare -g _STDLIB_RUN=1
 
@@ -27,7 +27,7 @@ _run_err() { echo -e "${_C_RED}  ✗${_C_RESET} $*" >&2; }
 stdlib::run::bootstrap_main() {
   local dry_run="${DRY_RUN:-false}"
   local skip_services="${SKIP_SERVICES:-false}"
-  local variables_file="${VARIABLES_FILE_CLI:-}"
+  local variables_file="${VARIABLES_ENV_FILE_CLI:-}"
   local interactive="${INTERACTIVE:-true}"
 
   # Parse flags passed through from entrypoint
@@ -65,6 +65,7 @@ stdlib::run::bootstrap_main() {
 
   # Import required stdlib modules
   stdlib::import sys/locking
+  stdlib::import core/sanitize
   stdlib::import core/config
   stdlib::import sys/os
   stdlib::import sys/user
@@ -88,22 +89,21 @@ stdlib::run::bootstrap_main() {
 
   # ── Phase 0: Tmpfs workspace ──
   _run_log "Phase 0: Creating tmpfs workspace..."
-  stdlib::tmpfs::create_workspace "${NAMESPACE_ROOT:-}" "bootstrap"
+  stdlib::tmpfs::create_workspace "${NAMESPACE_ROOT_DIR:-}" "bootstrap"
   _run_ok "TMP_DIR=${TMP_DIR}"
 
   # ── Phase 1: Resolve variables ──
   _run_log "Phase 1: Resolving variables..."
 
-  # Try BWS project "variables" first (canonical source)
-  if stdlib::config::load_from_bws 2>/dev/null; then
-    _run_ok "Variables loaded from BWS project 'variables'"
-  fi
+  # Resolve core variables first (NAMESPACE, SYSTEM_*, paths)
+  stdlib::config::resolve_vars "$variables_file" "$interactive"
+  _run_ok "NAMESPACE=${NAMESPACE}, USER=${SYSTEM_USERNAME}, UID=${SYSTEM_USER_UID}"
 
-  # Discover and load local variables file (supplements/overrides BWS)
-  local vfile
-  vfile="$(stdlib::config::discover_file "$variables_file" 2>/dev/null || true)"
-  stdlib::config::resolve_vars "$vfile" "$interactive"
-  _run_ok "NAMESPACE=${NAMESPACE}, USER=${BOOTSTRAP_USER}, UID=${BOOTSTRAP_UID}"
+  # Load full config chain: defaults → BWS → variables.env → secrets.env → global.conf
+  local repo_dir
+  repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+  stdlib::config::load_chain "$repo_dir"
+  _run_ok "Config chain loaded"
 
   # ── Phase 2: Probe environment ──
   _run_log "Phase 2: Probing environment..."
@@ -133,9 +133,11 @@ stdlib::run::bootstrap_main() {
     stdlib::run::ensure_services
   fi
 
-  # ── Phase 8: Seed variables file ──
+  # ── Phase 8: Seed variables + global config ──
   _run_log "Phase 8: Seeding variables file..."
   stdlib::config::seed_file
+  stdlib::config::ensure_global_conf
+  _run_ok "Seeded"
 
   # ── Release bootstrap lock ──
   stdlib::lock::release "$_lockfile"
@@ -169,30 +171,30 @@ stdlib::run::probe_environment() {
 # ── stdlib::run::ensure_identity ──────────────────────────────────────
 stdlib::run::ensure_identity() {
   if [[ "$DRY_RUN" == "true" ]]; then
-    _run_ok "[dry-run] Would ensure ${BOOTSTRAP_USER}:${BOOTSTRAP_GROUP} (${BOOTSTRAP_UID}:${BOOTSTRAP_GID})"
+    _run_ok "[dry-run] Would ensure ${SYSTEM_USERNAME}:${SYSTEM_GROUPNAME} (${SYSTEM_USER_UID}:${SYSTEM_GROUP_GID})"
     return 0
   fi
 
   stdlib::user::ensure_identity \
-    "$BOOTSTRAP_USER" "$BOOTSTRAP_GROUP" \
-    "$BOOTSTRAP_UID" "$BOOTSTRAP_GID" \
+    "$SYSTEM_USERNAME" "$SYSTEM_GROUPNAME" \
+    "$SYSTEM_USER_UID" "$SYSTEM_GROUP_GID" \
     "docker"
 
-  _run_ok "Identity: ${BOOTSTRAP_USER}:${BOOTSTRAP_GROUP} (${BOOTSTRAP_UID}:${BOOTSTRAP_GID})"
+  _run_ok "Identity: ${SYSTEM_USERNAME}:${SYSTEM_GROUPNAME} (${SYSTEM_USER_UID}:${SYSTEM_GROUP_GID})"
 }
 
 # ── stdlib::run::ensure_layout ────────────────────────────────────────
 stdlib::run::ensure_layout() {
   if [[ "$DRY_RUN" == "true" ]]; then
-    _run_ok "[dry-run] Would create ${NAMESPACE_ROOT} with standard dirs"
+    _run_ok "[dry-run] Would create ${NAMESPACE_ROOT_DIR} with standard dirs"
     return 0
   fi
 
   stdlib::layout::ensure_all \
-    "$NAMESPACE_ROOT" "$NAMESPACE" \
-    "$BOOTSTRAP_USER" "$BOOTSTRAP_GROUP"
+    "$NAMESPACE_ROOT_DIR" "$NAMESPACE" \
+    "$SYSTEM_USERNAME" "$SYSTEM_GROUPNAME"
 
-  _run_ok "Layout: ${NAMESPACE_ROOT}/{github,configs,appdata,scripts,.ignore}"
+  _run_ok "Layout: ${NAMESPACE_ROOT_DIR}/{github,configs,appdata,scripts,.ignore}"
 }
 
 # ── stdlib::run::ensure_tmpfs ─────────────────────────────────────────
@@ -207,17 +209,17 @@ stdlib::run::ensure_tmpfs() {
   total_ram_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 2097152)"
   half_ram_mb=$((total_ram_kb / 2 / 1024))
 
-  # ── $NAMESPACE_ROOT/tmp — 50% RAM, sticky bit, noexec ──
-  stdlib::tmpfs::ensure_mount "${NAMESPACE_ROOT}/tmp" "$half_ram_mb" "1777" \
-    "${BOOTSTRAP_UID}" "${BOOTSTRAP_GID}"
-  _run_ok "tmpfs: ${NAMESPACE_ROOT}/tmp (${half_ram_mb}M)"
+  # ── $NAMESPACE_ROOT_DIR/tmp — 50% RAM, sticky bit, noexec ──
+  stdlib::tmpfs::ensure_mount "${NAMESPACE_ROOT_DIR}/tmp" "$half_ram_mb" "1777" \
+    "${SYSTEM_USER_UID}" "${SYSTEM_GROUP_GID}"
+  _run_ok "tmpfs: ${NAMESPACE_ROOT_DIR}/tmp (${half_ram_mb}M)"
 
-  # ── $NAMESPACE_ROOT/logs — min(1G, 50% RAM), mode 0775 ──
+  # ── $NAMESPACE_ROOT_DIR/logs — min(1G, 50% RAM), mode 0775 ──
   local cap_mb=1024
   local logs_mb=$((half_ram_mb < cap_mb ? half_ram_mb : cap_mb))
-  stdlib::tmpfs::ensure_mount "${NAMESPACE_ROOT}/logs" "$logs_mb" "0775" \
-    "${BOOTSTRAP_UID}" "${BOOTSTRAP_GID}"
-  _run_ok "tmpfs: ${NAMESPACE_ROOT}/logs (${logs_mb}M)"
+  stdlib::tmpfs::ensure_mount "${NAMESPACE_ROOT_DIR}/logs" "$logs_mb" "0775" \
+    "${SYSTEM_USER_UID}" "${SYSTEM_GROUP_GID}"
+  _run_ok "tmpfs: ${NAMESPACE_ROOT_DIR}/logs (${logs_mb}M)"
 }
 
 # ── stdlib::run::ensure_secrets_and_variables ─────────────────────────
@@ -273,7 +275,7 @@ stdlib::run::ensure_services() {
   _run_ok "Base packages installed"
 
   # ── Docker ──
-  stdlib::docker_install::ensure "${BOOTSTRAP_USER}"
+  stdlib::docker_install::ensure "${SYSTEM_USERNAME}"
   _run_ok "Docker CE installed/verified"
 
   # ── Docker network ──
@@ -311,9 +313,9 @@ stdlib::run::print_summary() {
   echo -e "${_C_BLUE}║                     Bootstrap Complete                       ║${_C_RESET}"
   echo -e "${_C_BLUE}╠═══════════════════════════════════════════════════════════════╣${_C_RESET}"
   printf "${_C_BLUE}║${_C_RESET}  %-16s ${_C_GREEN}%s${_C_RESET}\n" "Namespace:" "${NAMESPACE:-unset}"
-  printf "${_C_BLUE}║${_C_RESET}  %-16s ${_C_GREEN}%s${_C_RESET}\n" "Root:" "${NAMESPACE_ROOT:-unset}"
-  printf "${_C_BLUE}║${_C_RESET}  %-16s ${_C_GREEN}%s${_C_RESET}\n" "User:" "${BOOTSTRAP_USER:-unset}"
-  printf "${_C_BLUE}║${_C_RESET}  %-16s ${_C_GREEN}%s${_C_RESET}\n" "UID/GID:" "${BOOTSTRAP_UID:-?}:${BOOTSTRAP_GID:-?}"
+  printf "${_C_BLUE}║${_C_RESET}  %-16s ${_C_GREEN}%s${_C_RESET}\n" "Root:" "${NAMESPACE_ROOT_DIR:-unset}"
+  printf "${_C_BLUE}║${_C_RESET}  %-16s ${_C_GREEN}%s${_C_RESET}\n" "User:" "${SYSTEM_USERNAME:-unset}"
+  printf "${_C_BLUE}║${_C_RESET}  %-16s ${_C_GREEN}%s${_C_RESET}\n" "UID/GID:" "${SYSTEM_USER_UID:-?}:${SYSTEM_GROUP_GID:-?}"
   printf "${_C_BLUE}║${_C_RESET}  %-16s ${_C_GREEN}%s${_C_RESET}\n" "TMP_DIR:" "${TMP_DIR:-none}"
   printf "${_C_BLUE}║${_C_RESET}  %-16s ${_C_GREEN}%s${_C_RESET}\n" "Dry-run:" "${DRY_RUN:-false}"
   echo -e "${_C_BLUE}╚═══════════════════════════════════════════════════════════════╝${_C_RESET}"
