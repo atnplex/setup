@@ -27,7 +27,7 @@ bootstrap.sh              → 66-line thin entrypoint
             ├─ sys/user.sh           user/group/UID/GID enforcement
             ├─ sys/tmpfs.sh          tmpfs detection + TMP_DIR contract
             ├─ sys/fstab.sh          fstab entry management
-            ├─ sys/secrets.sh        4-tier secrets (env → keyctl → age → BWS)
+            ├─ sys/secrets.sh        4-tier secrets (env → keyctl → age → BWS → peers)
             ├─ sys/hostname.sh       hostname management
             ├─ sys/deps.sh           package dependency management
             ├─ sys/service.sh        systemd service management
@@ -40,8 +40,6 @@ bootstrap.sh              → 66-line thin entrypoint
 
 Only user-settable variables are listed. All other values are auto-derived internally.
 
-### User-Settable
-
 | Variable           | Default            | Description                         |
 | ------------------ | ------------------ | ----------------------------------- |
 | `NAMESPACE`        | `atn`              | Namespace name                      |
@@ -52,33 +50,57 @@ Only user-settable variables are listed. All other values are auto-derived inter
 | `SKIP_SERVICES`    | `false`            | Skip Docker/Tailscale install phase |
 | `INTERACTIVE`      | `auto`             | Enable/disable interactive prompts  |
 
-### Config Load Chain
+## Config Load Chain
 
 Resolution order (last wins):
 
-1. `defaults.env` (repo defaults)
-2. BWS project `variables` (if available)
-3. `variables.env` (auto-discovered)
-4. `secrets.env` (auto-discovered, sensitive)
-5. `global.conf` (highest precedence — user overrides)
+1. `defaults.env` — repo defaults
+2. BWS project `variables` — if available
+3. `variables.env` — auto-discovered
+4. `secrets.env` — auto-discovered, sensitive
+5. `global.conf` — **highest precedence** (user overrides)
 
-Discovery searches `/<namespace>/.ignore/`, `/<namespace>/`, and `/<namespace>/configs/` for each file.
+### Discovery Rules
 
-### Auto-Derived (Internal)
+Config files (`variables.env`, `secrets.env`, `secrets.age`) are found automatically:
 
-These are never user-settable and not documented as config options:
+1. **Priority-ordered paths** (checked first, in order):
+   - `/<namespace>/.ignore/<filename>` → highest priority
+   - `/<namespace>/configs/<filename>`
+   - `/<namespace>/<filename>`
 
-| Derived Variable     | Formula               |
-| -------------------- | --------------------- |
-| `NAMESPACE_ROOT_DIR` | `/${NAMESPACE}`       |
-| `SYSTEM_USERNAME`    | `= GH_ORG`            |
-| `SYSTEM_GROUPNAME`   | `= SYSTEM_USERNAME`   |
-| `SYSTEM_GROUP_GID`   | `= SYSTEM_USER_UID`   |
-| `DOCKER_NETWORK`     | `${NAMESPACE}_bridge` |
+2. **4-level `find` fallback** — searches `/` to a max depth of 4, excluding standard system directories:
+   `/bin`, `/boot`, `/dev`, `/etc`, `/lib`, `/lib64`, `/media`, `/mnt`, `/opt`, `/proc`, `/root`, `/run`, `/sbin`, `/sys`, `/tmp`, `/usr`, `/var`
+
+This ensures user/application directories (`/atn`, `/home/*`, `/srv`) are searched without polluting results with OS internals.
+
+### Global Config (SSOT)
+
+`global.conf` is stored at `/<namespace>/configs/global.conf` and loaded last (highest precedence).
+
+If the file does not exist, the bootstrap will:
+
+1. **Download** the canonical template from `https://github.com/atnplex/setup/configs/global.conf`
+2. **Force-comment** all settings (safety guarantee)
+3. **Fall back** to generating a local template if download fails
+
+All settings in `global.conf` are commented out by default. Uncomment any line to override the corresponding default.
+
+## Secret Acquisition
+
+Secrets are acquired through a tiered fallback chain:
+
+| Priority | Source           | Description                                |
+| -------- | ---------------- | ------------------------------------------ |
+| 1        | Environment vars | Pre-set via `export`                       |
+| 2        | Kernel keyctl    | In-memory keyring                          |
+| 3        | `secrets.age`    | Encrypted file (age)                       |
+| 4        | BWS (Bitwarden)  | Fetched via `bws` CLI                      |
+| 5        | Tailscale peers  | SSH to reachable Linux peers (last resort) |
+
+The **Tailscale peer fallback** (priority 5) only runs when all other methods fail. It enumerates reachable Linux peers, attempts to read their `secrets.env` via SSH (with strict timeouts), validates every line, and stops after the first successful peer. It is safe, optional, and never blocks bootstrap.
 
 ## Module Library
-
-The `lib/` directory contains a complete Bash standard library:
 
 | Category | Modules                                                                                                                       | Purpose               |
 | -------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------- |

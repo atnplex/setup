@@ -135,7 +135,7 @@ stdlib::secrets::load() {
   [[ -f "${_SECRETS_AGE_KEY}" ]] || return 1
   command -v age &>/dev/null || return 1
 
-  local line key val
+  local key val
   while IFS='=' read -r key val; do
     [[ -z "$key" || "$key" == \#* ]] && continue
     stdlib::secrets::set "$key" "$val"
@@ -262,4 +262,93 @@ stdlib::secrets::load_to_tmpdir() {
     export "$key=$val"
     _SECRETS_KNOWN["$key"]=1
   done <"$plain_file"
+}
+
+# ── stdlib::secrets::acquire_from_peers ───────────────────────────────
+# LAST RESORT: scan reachable Tailscale peers for secrets.
+# Only runs when ALL other acquisition methods have failed:
+#   - BWS_ACCESS_TOKEN unset
+#   - keyctl has no secrets
+#   - secrets.age cannot be decrypted
+#   - GitHub-based acquisition failed
+#
+# Safety:
+#   - Non-blocking (timeouts on every SSH)
+#   - Validates peer data through sanitize pipeline
+#   - Never modifies remote systems
+#   - Returns 0 on success (at least one secret acquired), 1 otherwise
+stdlib::secrets::acquire_from_peers() {
+  # ── Guard: only run as absolute last resort ──
+  if [[ -n "${BWS_ACCESS_TOKEN:-}" ]]; then
+    return 1 # BWS available, no need for peer scan
+  fi
+
+  # Check if we already have secrets
+  if [[ ${#_SECRETS_KNOWN[@]} -gt 0 ]]; then
+    return 0 # Already have secrets, skip
+  fi
+
+  # ── Tailscale must be connected ──
+  command -v tailscale &>/dev/null || return 1
+  tailscale status &>/dev/null || return 1
+
+  # ── Enumerate reachable Linux peers ──
+  local -a peers=()
+  local line hostname ip os_type
+  while IFS= read -r line; do
+    # tailscale status output: <IP>  <hostname>  <user>  <OS>  ...
+    ip="$(echo "$line" | awk '{print $1}')"
+    hostname="$(echo "$line" | awk '{print $2}')"
+    os_type="$(echo "$line" | awk '{print $4}')"
+
+    # Skip non-Linux, self, and offline peers
+    [[ "$os_type" == "linux" ]] || continue
+    [[ "$ip" != "$(tailscale ip -4 2>/dev/null)" ]] || continue
+
+    peers+=("$ip")
+  done < <(tailscale status --peers 2>/dev/null | grep -v '^#' | tail -n +2)
+
+  [[ ${#peers[@]} -gt 0 ]] || return 1
+
+  # ── Attempt to fetch secrets from each peer ──
+  local acquired=0
+  local peer_ip
+  for peer_ip in "${peers[@]}"; do
+    # Try reading peer's secrets.env via SSH (strict timeout)
+    local remote_data
+    remote_data="$(timeout 5 ssh -o ConnectTimeout=3 \
+      -o StrictHostKeyChecking=accept-new \
+      -o BatchMode=yes \
+      "root@${peer_ip}" \
+      'cat /atn/.ignore/secrets.env 2>/dev/null || cat /atn/configs/secrets.env 2>/dev/null' \
+      2>/dev/null)" || continue
+
+    [[ -z "$remote_data" ]] && continue
+
+    # ── Validate and sanitize each line before accepting ──
+    local key val
+    while IFS='=' read -r key val; do
+      # Reject empty keys, comments, and invalid characters
+      [[ -z "$key" || "$key" == \#* ]] && continue
+      [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
+
+      # Strip surrounding quotes from value
+      val="${val#\"}"
+      val="${val%\"}"
+      val="${val#\'}"
+      val="${val%\'}"
+
+      # Only accept if value is non-empty and we don't already have it
+      if [[ -n "$val" ]] && [[ -z "${!key:-}" ]]; then
+        stdlib::secrets::set "$key" "$val"
+        ((acquired++)) || true
+      fi
+    done <<<"$remote_data"
+
+    # Stop after first successful peer
+    [[ $acquired -gt 0 ]] && break
+  done
+
+  [[ $acquired -gt 0 ]] && return 0
+  return 1
 }

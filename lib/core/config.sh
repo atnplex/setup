@@ -1,71 +1,89 @@
 #!/usr/bin/env bash
 # Module: core/config
-# Version: 0.2.0
+# Version: 0.3.0
 # Provides: Variables discovery, loading, resolution, seeding, BWS integration
 # Requires: core/sanitize (for no-eval loading)
 [[ -n "${_STDLIB_CONFIG:-}" ]] && return 0
 declare -g _STDLIB_CONFIG=1
 
+# ── System directories to EXCLUDE from discovery searches ─────────────
+declare -ga _CONFIG_EXCLUDE_DIRS=(
+  /bin /boot /dev /etc /lib /lib32 /lib64 /libx32
+  /media /mnt /opt /proc /root /run /sbin /snap
+  /sys /tmp /usr /var /lost+found
+)
+
+# ── stdlib::config::_discover_file ────────────────────────────────────
+# Find a config file by name, searching preferred paths first then
+# falling back to a 4-level depth search under NAMESPACE_ROOT_DIR.
+#
+# Priority:
+#   1. .ignore/<filename>          (most specific)
+#   2. configs/<filename>
+#   3. <root>/<filename>
+#   4. 4-level find under root     (broadest, excludes system dirs)
+#
+# Usage: stdlib::config::_discover_file <filename> [root_dir]
+# Returns: path on stdout, or nothing if not found
+stdlib::config::_discover_file() {
+  local filename="$1"
+  local root="${2:-${NAMESPACE_ROOT_DIR:-}}"
+  [[ -z "$root" ]] && return 1
+
+  # ── Priority-ordered static paths ──
+  local f
+  for f in \
+    "${root}/.ignore/${filename}" \
+    "${root}/configs/${filename}" \
+    "${root}/${filename}"; do
+    if [[ -f "$f" ]]; then
+      echo "$f"
+      return 0
+    fi
+  done
+
+  # ── 4-level find with system directory exclusion ──
+  if command -v find &>/dev/null; then
+    local -a prune_args=()
+    local d
+    for d in "${_CONFIG_EXCLUDE_DIRS[@]}"; do
+      prune_args+=(-path "$d" -o)
+    done
+
+    local result
+    result="$(find / \( "${prune_args[@]}" -false \) -prune \
+      -o -maxdepth 4 -name "$filename" -type f -print -quit 2>/dev/null)"
+    if [[ -n "$result" ]]; then
+      echo "$result"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
 # ── stdlib::config::discover_files ────────────────────────────────────
-# Search the top 4 directory levels under NAMESPACE_ROOT_DIR for:
-#   variables.env, secrets.env, secrets.age
-# Populates global variables: VARIABLES_ENV_FILE, SECRETS_ENV_FILE,
-# ENCRYPTED_SECRETS_AGE_FILE
-# Conventional search paths (in priority order):
-#   1. .ignore/<filename>
-#   2. <filename> (at root)
-#   3. configs/<filename>
+# Populate VARIABLES_ENV_FILE, SECRETS_ENV_FILE, ENCRYPTED_SECRETS_AGE_FILE,
+# GLOBAL_CONF_FILE by searching prioritized paths.
 stdlib::config::discover_files() {
   local root="${NAMESPACE_ROOT_DIR:-}"
   [[ -z "$root" ]] && return 1
 
-  local f
-
-  # ── variables.env ──
   if [[ -z "${VARIABLES_ENV_FILE:-}" ]]; then
-    for f in \
-      "${root}/.ignore/variables.env" \
-      "${root}/variables.env" \
-      "${root}/configs/variables.env" \
-      "/etc/bootstrap/variables.env"; do
-      if [[ -f "$f" ]]; then
-        VARIABLES_ENV_FILE="$f"
-        break
-      fi
-    done
+    VARIABLES_ENV_FILE="$(stdlib::config::_discover_file variables.env "$root" 2>/dev/null || true)"
   fi
   export VARIABLES_ENV_FILE="${VARIABLES_ENV_FILE:-}"
 
-  # ── secrets.env ──
   if [[ -z "${SECRETS_ENV_FILE:-}" ]]; then
-    for f in \
-      "${root}/.ignore/secrets.env" \
-      "${root}/secrets.env" \
-      "${root}/configs/secrets.env"; do
-      if [[ -f "$f" ]]; then
-        SECRETS_ENV_FILE="$f"
-        break
-      fi
-    done
+    SECRETS_ENV_FILE="$(stdlib::config::_discover_file secrets.env "$root" 2>/dev/null || true)"
   fi
   export SECRETS_ENV_FILE="${SECRETS_ENV_FILE:-}"
 
-  # ── secrets.age ──
   if [[ -z "${ENCRYPTED_SECRETS_AGE_FILE:-}" ]]; then
-    for f in \
-      "${root}/.ignore/secrets.age" \
-      "${root}/secrets.age" \
-      "${root}/.ignore/secrets/secrets.age" \
-      "${root}/configs/secrets.age"; do
-      if [[ -f "$f" ]]; then
-        ENCRYPTED_SECRETS_AGE_FILE="$f"
-        break
-      fi
-    done
+    ENCRYPTED_SECRETS_AGE_FILE="$(stdlib::config::_discover_file secrets.age "$root" 2>/dev/null || true)"
   fi
   export ENCRYPTED_SECRETS_AGE_FILE="${ENCRYPTED_SECRETS_AGE_FILE:-}"
 
-  # ── global.conf ──
   export GLOBAL_CONF_FILE="${GLOBAL_CONF_FILE:-${root}/configs/global.conf}"
 }
 
@@ -226,7 +244,10 @@ SEED_EOF
 }
 
 # ── stdlib::config::ensure_global_conf ────────────────────────────────
-# Create global.conf if missing — all settings commented out.
+# Ensure global.conf exists. If missing:
+#   1. Try downloading the canonical template from GitHub
+#   2. Fall back to generating a local template
+# All settings are commented out by default.
 stdlib::config::ensure_global_conf() {
   local target="${GLOBAL_CONF_FILE:-${NAMESPACE_ROOT_DIR:-}/configs/global.conf}"
   [[ -f "$target" ]] && return 0
@@ -235,10 +256,42 @@ stdlib::config::ensure_global_conf() {
   parent="$(dirname "$target")"
   [[ -d "$parent" ]] || sudo mkdir -p "$parent"
 
-  cat >"$target" <<'CONF_EOF'
+  # ── Attempt download from canonical source ──
+  local url="https://raw.githubusercontent.com/atnplex/setup/modular/configs/global.conf"
+  local downloaded=false
+
+  if command -v curl &>/dev/null; then
+    if curl -fsSL --connect-timeout 5 --max-time 10 "$url" -o "$target" 2>/dev/null; then
+      downloaded=true
+    fi
+  elif command -v wget &>/dev/null; then
+    if wget -q --timeout=10 "$url" -O "$target" 2>/dev/null; then
+      downloaded=true
+    fi
+  fi
+
+  # ── Verify downloaded file has content, else generate locally ──
+  if [[ "$downloaded" == "true" ]] && [[ -s "$target" ]]; then
+    # Ensure all lines are commented (safety: force-comment any uncommented settings)
+    local tmpf
+    tmpf="$(mktemp)"
+    while IFS='' read -r line || [[ -n "$line" ]]; do
+      # Skip blank lines and already-commented lines
+      if [[ -z "$line" ]] || [[ "$line" == \#* ]]; then
+        printf '%s\n' "$line"
+      else
+        # Comment out any uncommented KEY=VALUE line
+        printf '# %s\n' "$line"
+      fi
+    done <"$target" >"$tmpf"
+    mv -f "$tmpf" "$target"
+  else
+    # ── Local fallback template ──
+    cat >"$target" <<'CONF_EOF'
 # Global Configuration — User Overrides
 # Uncomment and modify any setting to override defaults.
 # This file is loaded LAST and has the HIGHEST precedence.
+# Source of Truth: https://github.com/atnplex/setup/configs/global.conf
 #
 # ── Namespace ──
 # NAMESPACE=atn
@@ -260,6 +313,7 @@ stdlib::config::ensure_global_conf() {
 # SKIP_SERVICES=false
 # INTERACTIVE=true
 CONF_EOF
+  fi
 
   sudo chown "${SYSTEM_USERNAME:-root}:${SYSTEM_GROUPNAME:-root}" "$target" 2>/dev/null || true
   chmod 644 "$target" 2>/dev/null || true
