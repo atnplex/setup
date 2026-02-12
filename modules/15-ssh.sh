@@ -37,10 +37,6 @@ else
 fi
 
 # Install server on Debian/Ubuntu only
-if declare -F stdlib::os::detect &>/dev/null; then
-  stdlib::os::detect 2>/dev/null || true
-fi
-
 local_distro="$(stdlib::os::distro 2>/dev/null || echo unknown)"
 case "$local_distro" in
   ubuntu|debian)
@@ -99,23 +95,23 @@ if [[ -d "${NAMESPACE_ROOT_DIR}/configs/ssh" ]]; then
 fi
 
 # ── 3. Harden sshd_config (idempotent) ───────────────────────────────
-SCHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_CONFIG="/etc/ssh/sshd_config"
 
 _ssh_set_config() {
   local key="$1" value="$2"
-  if grep -qE "^\s*${key}\s" "$SCHD_CONFIG" 2>/dev/null; then
+  if grep -qE "^\s*${key}\s" "$SSHD_CONFIG" 2>/dev/null; then
     # Update existing line
-    sudo sed -i "s|^\s*${key}\s.*|${key} ${value}|" "$SCHD_CONFIG"
-  elif grep -qE "^#\s*${key}\s" "$SCHD_CONFIG" 2>/dev/null; then
+    sudo sed -i "s|^\s*${key}\s.*|${key} ${value}|" "$SSHD_CONFIG"
+  elif grep -qE "^#\s*${key}\s" "$SSHD_CONFIG" 2>/dev/null; then
     # Uncomment and set
-    sudo sed -i "s|^#\s*${key}\s.*|${key} ${value}|" "$SCHD_CONFIG"
+    sudo sed -i "s|^#\s*${key}\s.*|${key} ${value}|" "$SSHD_CONFIG"
   else
     # Append
-    echo "${key} ${value}" | sudo tee -a "$SCHD_CONFIG" >/dev/null
+    echo "${key} ${value}" | sudo tee -a "$SSHD_CONFIG" >/dev/null
   fi
 }
 
-if [[ -f "$SCHD_CONFIG" ]]; then
+if [[ -f "$SSHD_CONFIG" ]]; then
   echo "[15-ssh] Hardening sshd_config..."
   _ssh_set_config "PermitRootLogin" "no"
   _ssh_set_config "PasswordAuthentication" "no"
@@ -130,11 +126,12 @@ if [[ -f "$SCHD_CONFIG" ]]; then
 
   # Validate config before reloading
   if sudo sshd -t 2>/dev/null; then
-    if declare -F stdlib::service::reload &>/dev/null; then
-      stdlib::service::reload ssh 2>/dev/null || stdlib::service::reload sshd 2>/dev/null || true
-    else
-      sudo systemctl reload ssh 2>/dev/null || sudo systemctl reload sshd 2>/dev/null || true
-    fi
+    # Use systemctl reload directly — stdlib::service has no per-service reload
+    sudo systemctl reload ssh 2>/dev/null \
+      || sudo systemctl reload sshd 2>/dev/null \
+      || sudo systemctl restart ssh 2>/dev/null \
+      || sudo systemctl restart sshd 2>/dev/null \
+      || true
     echo "[15-ssh] ✓ sshd_config hardened and reloaded"
   else
     echo "[15-ssh] ⚠ sshd_config validation failed — not reloading" >&2
